@@ -101,11 +101,10 @@ files of the same name in the tree.
 
 ### WiFi calibration file
 
-The MT7916 needs `/lib/firmware/mediatek/mt7916_eeprom.bin`. It is **not**
-included (Zyxel's copyright). Copy it from your own unit's stock firmware:
-`/usr/etc/Wireless/RT2860AP_AC/RT30xxEEPROM.bin` (4096 bytes, starts with
-`16 79`) and put it in `target/linux/airoha/en7523/base-files/lib/firmware/mediatek/`
-before building.
+Images ship MediaTek's generic `mt7916_eeprom.bin` from the mt76 repository
+(license: `/lib/firmware/mediatek/LICENSE.mt76-firmware`). For Zyxel's
+board-specific calibration, extract it from your own stock backup with
+`tools/extract-eeprom.sh` (see the install guide, step 4b).
 
 ## Installation (first time)
 

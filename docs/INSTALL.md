@@ -146,6 +146,21 @@ Repeat `swap` until `bootflag read` shows `0`. OpenWrt then boots on its own:
 `192.168.1.1`, LuCI at `http://192.168.1.1`. Set a root password first
 (`passwd`).
 
+## 4b. WiFi calibration (recommended)
+
+The image ships MediaTek's generic `mt7916_eeprom.bin`; WiFi works with it.
+Zyxel's board-specific file (`RT30xxEEPROM.bin`) is not included (copyright),
+but it is inside your backup of the stock bank (`mtd5.bin`, step 3):
+
+```sh
+sudo apt install squashfs-tools     # or: sudo dnf install squashfs-tools
+sh tools/extract-eeprom.sh mtd5.bin 192.168.1.1
+ssh root@192.168.1.1 reboot
+```
+
+The script finds the file, checks size (4096) and MT7916 magic, installs it
+in `/lib/firmware/mediatek/` and adds it to `/etc/sysupgrade.conf`.
+
 ## 5. Back to stock
 
 - `bootflag swap` in U-Boot (flag `1`) + `reset`. Stock is untouched in bank 1.

@@ -173,6 +173,23 @@ açılır: `192.168.1.1`, LuCI web arayüzü `http://192.168.1.1`.
 
 **İlk iş:** root şifresi koyun (`passwd`) ve WiFi'yi kurun.
 
+## 4b. WiFi kalibrasyonu (önerilir)
+
+İmaj, MediaTek'in genel `mt7916_eeprom.bin` dosyasıyla gelir; WiFi bununla
+çalışır. Zyxel'in bu karta özel kalibrasyon dosyası (`RT30xxEEPROM.bin`)
+telif hakkı nedeniyle imajda yoktur, ama 3. adımda aldığınız yedekte
+(`mtd5.bin`, stok yazılım) duruyor. Tek komutla çıkarıp modeme kurun:
+
+```sh
+sudo dnf install squashfs-tools     # Debian/Ubuntu: sudo apt install squashfs-tools
+sh tools/extract-eeprom.sh mtd5.bin 192.168.1.1
+ssh root@192.168.1.1 reboot
+```
+
+Betik dosyayı bulur, boyutunu (4096 bayt) ve MT7916 imzasını kontrol eder,
+modemde `/lib/firmware/mediatek/` altına koyar ve `sysupgrade`'de
+korunması için `/etc/sysupgrade.conf`'a ekler.
+
 ## 5. Stok yazılıma geri dönmek
 
 - **Kolay yol:** U-Boot'ta `bootflag swap` (bayrak `1` olsun) + `reset`. Stok
