@@ -30,21 +30,37 @@ sorumluluğunuzdadır.
 
 Kartta 3,3 V seri port var, ayarları **115200 8N1**.
 
-| Adaptör | Modem |
-|---|---|
-| GND | GND |
-| RX | TX |
-| TX | RX |
-| VCC / 3,3 V | **bağlamayın** (modem kendi adaptöründen beslenir) |
+**Konum:** UART konnektörü **J521**, kartın sağ alt köşesinde, "AD" yazısının ve
+vida deliğinin hemen üstünde, büyük "4R7" bobininin sağında.
 
-TX ile RX çapraz bağlanır: adaptörün RX'i modemin TX'ine.
+![J521'in kartta yeri](img/uart-konum.jpg)
 
-> **Eksik:** Kartın içinden çekilmiş, UART pinlerinin yerini ve lehim
-> adımlarını gösteren fotoğraflar henüz eklenmedi. Eklenene kadar pinleri bir
-> multimetreyle bulun:
-> - **GND:** kasa/ekran ile süreklilik veren pin.
-> - **TX:** açılışta ~3,3 V civarında dalgalanan pin.
-> - **RX:** sabit ~3,3 V duran pin.
+**Önemli:** J521'in 2. ve 3. pini konnektöre **bağlı değildir**. Aradaki seri
+dirençler (**R192**, **R191**) fabrikada takılmamış. Konnektöre pin takıp bağlanırsanız
+hiçbir şey göremezsiniz. TX/RX kablolarını doğrudan bu boş direnç yerlerinin
+pedlerine (resimde kırmızı çizgilerin bittiği pedler) lehimleyin. Ya da R191/R192 yerine 0 Ω direnç
+veya ince bir tel köprüsü koyup konnektörü kullanın.
+
+![J521 pinleri ve R191/R192 pedleri](img/uart-pinler-yakin.jpg)
+
+Bu cihazda çalışan bağlantı:
+
+| Kart | İşlev | Kablo (örnek) | USB-TTL adaptörü |
+|---|---|---|---|
+| J521 pin 4 | GND | mor | GND |
+| R191 pedi (pin 3 tarafı) | modemin RX'i | turuncu | TXD |
+| R192 pedi (pin 2 tarafı) | modemin TX'i | sarı | RXD |
+| J521 pin 1 (▷ kare ped) | | **bağlamayın** | |
+| | | | 5V / VCC / 3V3: **bağlamayın** |
+
+![USB-TTL adaptörü: TXD turuncu, RXD sarı, GND mor](img/uart-adaptor.jpg)
+
+Lehim ipuçları:
+- Pedler çok küçük (SMD direnç yeri). İnce uçlu havya, flux ve ince (≤0,5 mm)
+  tel kullanın. Kabloyu karta bantla sabitleyin ki çekilince ped kopmasın.
+- Lehimden sonra multimetreyle komşu pedlerle kısa devre olmadığını kontrol edin.
+- Emin değilseniz önce ölçün: **GND** vida deliğinin bakır halkasıyla süreklilik
+  verir. Modemin **TX**'i açılış sırasında dalgalanır, **RX**'i sabit ~3,3 V durur.
 
 Terminali açın (adaptör genelde `/dev/ttyUSB0` olur):
 

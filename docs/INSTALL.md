@@ -29,19 +29,33 @@ return to it, but you follow this guide at your own risk.
 
 The board has a 3.3 V UART, **115200 8N1**.
 
-| Adapter | Board |
-|---|---|
-| GND | GND |
-| RX | TX |
-| TX | RX |
-| VCC / 3.3 V | **do not connect** |
+**Location:** header **J521**, bottom-right corner of the board, above the
+"AD" marking and the screw hole, right of the large "4R7" inductor.
 
-> **Missing:** photos of the opened board showing the UART pads and the
-> soldering steps are not added yet. Until then, find the pins with a
-> multimeter:
-> - **GND:** continuity to the shield.
-> - **TX:** fluctuates around 3.3 V during boot.
-> - **RX:** steady ~3.3 V.
+![J521 on the board](img/uart-konum.jpg)
+
+**Important:** pins 2 and 3 of J521 are **not connected** – the series resistors
+**R192** and **R191** are not populated. Solder TX/RX directly to those empty
+resistor pads (where the red lines end), or bridge R191/R192 with 0 Ω / a wire and use the
+header.
+
+![J521 pins and the R191/R192 pads](img/uart-pinler-yakin.jpg)
+
+Wiring used on this unit:
+
+| Board | Function | Wire (example) | USB-TTL adapter |
+|---|---|---|---|
+| J521 pin 4 | GND | purple | GND |
+| R191 pad (pin 3 side) | board RX | orange | TXD |
+| R192 pad (pin 2 side) | board TX | yellow | RXD |
+| J521 pin 1 (▷ square) | | **do not connect** | |
+| | | | 5V / VCC / 3V3: **do not connect** |
+
+![USB-TTL adapter](img/uart-adaptor.jpg)
+
+The pads are tiny (SMD resistor footprint): use a fine tip, flux and thin wire, tape the wires
+down, and check for shorts afterwards. GND has continuity to the copper ring of
+the screw hole; board TX toggles during boot, board RX sits at ~3.3 V.
 
 ```sh
 picocom -b 115200 /dev/ttyUSB0
