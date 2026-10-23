@@ -38,7 +38,7 @@ vida deliğinin hemen üstünde, büyük "4R7" bobininin sağında.
 **Önemli:** J521'in 2. ve 3. pini konnektöre **bağlı değildir**. Aradaki seri
 dirençler (**R192**, **R191**) fabrikada takılmamış. Konnektöre pin takıp bağlanırsanız
 hiçbir şey göremezsiniz. TX/RX kablolarını doğrudan bu boş direnç yerlerinin
-pedlerine (resimde kırmızı çizgilerin bittiği pedler) lehimleyin. Ya da R191/R192 yerine 0 Ω direnç
+pedlerine (resimde sarı halkalar) lehimleyin. Ya da R191/R192 yerine 0 Ω direnç
 veya ince bir tel köprüsü koyup konnektörü kullanın.
 
 ![J521 pinleri ve R191/R192 pedleri](img/uart-pinler-yakin.jpg)

@@ -36,7 +36,7 @@ The board has a 3.3 V UART, **115200 8N1**.
 
 **Important:** pins 2 and 3 of J521 are **not connected** – the series resistors
 **R192** and **R191** are not populated. Solder TX/RX directly to those empty
-resistor pads (where the red lines end), or bridge R191/R192 with 0 Ω / a wire and use the
+resistor pads (yellow rings), or bridge R191/R192 with 0 Ω / a wire and use the
 header.
 
 ![J521 pins and the R191/R192 pads](img/uart-pinler-yakin.jpg)
