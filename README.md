@@ -1,5 +1,20 @@
 # OpenWrt for the Zyxel EX3501-T0 (Airoha / EcoNet EN7523)
 
+> [!CAUTION]
+> **Never run `apk upgrade` or `apk add --force-...` on this image.**
+> The kernel and drivers are custom builds. Packages from downloads.openwrt.org
+> do not match them: one such command removed the WiFi driver, firewall and
+> PPPoE in a single step during testing. Update only by building a new image
+> and running `sysupgrade`. The image ships an apk guard that refuses these
+> commands; do not bypass it.
+>
+> **Bu imajda asla `apk upgrade` ya da `apk add --force-...` çalıştırmayın.**
+> Çekirdek ve sürücüler özel derlemedir; downloads.openwrt.org'daki paketler
+> bunlarla uyumlu değildir. Testlerde tek bir böyle komut WiFi sürücüsünü,
+> güvenlik duvarını ve PPPoE'yi bir anda sildi. Güncelleme yalnızca yeni imaj
+> derleyip `sysupgrade` yaparak yapılır. İmajdaki apk koruması bu komutları
+> reddeder; atlatmaya çalışmayın.
+
 Out-of-tree OpenWrt support for the **Zyxel EX3501-T0** WiFi 6 gateway
 (Airoha EN7523 SoC, 2× Cortex-A53 in AArch32 mode, MediaTek MT7916 WiFi 6,
 512 MiB SPI-NAND). Everything here was brought up and tested on real
