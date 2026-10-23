@@ -8,6 +8,7 @@ Bu rehber modeme OpenWrt'yi ilk kez yüklemeyi anlatır. Sırasıyla:
 2. OpenWrt'yi sadece RAM'de çalıştırmak (flash'a hiçbir şey yazılmaz)
 3. **Flash'ın tam yedeği.** Bu adımı atlamayın.
 4. OpenWrt'yi flash'a yazmak
+   4b. Zyxel'in WiFi kalibrasyonunu kurmak (önerilir)
 5. Stok yazılıma geri dönmek
 
 **Riskler:** Kutuyu açmak garantiyi bitirir. Yanlış voltaj (5 V) seri portu
@@ -19,8 +20,9 @@ sorumluluğunuzdadır.
 
 - **3,3 V USB-TTL seri adaptörü** (CH340, CP2102, FT232...). Mutlaka **3,3 V**
   olmalı; adaptörde 5 V/3,3 V seçimi varsa 3,3 V'a alın.
-- 3 adet jumper kablo (TX, RX, GND). Kartta pin yoksa havya, ince lehim ve
-  3 adet pin header.
+- İnce uçlu havya, flux, ince lehim ve 3 ince kablo (TX, RX, GND). TX/RX
+  küçük direnç pedlerine lehimlenir (1. adım); sadece pin header takmak
+  işe yaramaz.
 - Ethernet kablosu, Linux bilgisayar (Windows'ta da olur, komutlar farklı).
 - Bilgisayarda bir TFTP sunucusu (`tftp-server`, `tftpd-hpa` ya da `dnsmasq`)
   ve seri terminal (`picocom`, `minicom`, `screen` ya da PuTTY).

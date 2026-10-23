@@ -8,6 +8,7 @@ Steps:
 2. Run OpenWrt from RAM only (nothing is written to flash)
 3. **Full flash backup.** Do not skip this.
 4. Write OpenWrt to flash
+   4b. Install Zyxel's WiFi calibration (recommended)
 5. Going back to stock
 
 **Risks:** opening the case voids the warranty, and 5 V on the serial pins
@@ -18,8 +19,9 @@ return to it, but you follow this guide at your own risk.
 
 - A **3.3 V USB-TTL serial adapter** (CH340, CP2102, FT232...). Set it to
   3.3 V if it has a jumper.
-- 3 jumper wires (TX, RX, GND). If the board has no header pins: a soldering
-  iron, thin solder and a 3-pin header.
+- A soldering iron with a fine tip, flux, thin solder and 3 thin wires
+  (TX, RX, GND). TX/RX must be soldered to small resistor pads (see step 1);
+  a pin header alone does not work.
 - An Ethernet cable and a computer (Linux commands below).
 - A TFTP server (`tftp-server`, `tftpd-hpa` or `dnsmasq`) and a serial
   terminal (`picocom`, `minicom`, `screen`, PuTTY).
