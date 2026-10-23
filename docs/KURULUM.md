@@ -30,10 +30,6 @@ sorumluluğunuzdadır.
 
 Kartta 3,3 V seri port var, ayarları **115200 8N1**.
 
-![USB-TTL adaptörü modeme bağlı](img/uart-baglanti.jpg)
-
-*USB-TTL adaptörü modeme bağlı. Kablolar kasanın içindeki seri porta gidiyor.*
-
 | Adaptör | Modem |
 |---|---|
 | GND | GND |

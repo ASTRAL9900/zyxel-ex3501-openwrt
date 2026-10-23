@@ -29,8 +29,6 @@ return to it, but you follow this guide at your own risk.
 
 The board has a 3.3 V UART, **115200 8N1**.
 
-![USB-TTL adapter connected to the unit](img/uart-baglanti.jpg)
-
 | Adapter | Board |
 |---|---|
 | GND | GND |
