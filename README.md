@@ -94,19 +94,12 @@ before building.
 
 ## Installation (first time)
 
-The unit has two firmware banks. OpenWrt goes into **bank 0**; the stock
-firmware stays in **bank 1** as a fallback. U-Boot picks the bank with its
-`bootflag` (`bootflag read`, `bootflag swap`).
+Step-by-step guide with photos, **including a full flash backup**:
+[docs/INSTALL.md](docs/INSTALL.md) · Türkçe: [docs/KURULUM.md](docs/KURULUM.md)
 
-1. Open the case and connect a 3.3 V serial console (115200 8N1).
-2. Interrupt U-Boot, TFTP-load the `initramfs-kernel.bin` image and `bootm` it
-   (OpenWrt runs from RAM, nothing is written).
-3. From the RAM system: `sysupgrade -n <squashfs-sysupgrade.bin>`. This writes
-   the HDR2+FIT kernel and creates the UBI volumes in bank 0.
-4. Make U-Boot boot bank 0 (`bootflag swap` until `bootflag read` says 0).
-
-To go back to stock: `bootflag swap` in U-Boot. Later updates are a normal
-`sysupgrade` from the running system.
+Short version: serial console → TFTP-boot the initramfs image from U-Boot
+(nothing written) → back up all MTD partitions → `sysupgrade -n` →
+`bootflag swap` to bank 0. The stock firmware stays in bank 1 as a fallback.
 
 **Never use `apk upgrade` or `apk add --force-*` on this image.** The kernel
 and drivers are custom; mixing in packages from downloads.openwrt.org can
@@ -141,7 +134,7 @@ hand). A power cycle always leaves a rescue mode entered with `kurtar mod`.
 Zyxel EX3501-T0 (Airoha EN7523) için OpenWrt desteği. Kablolu donanım NAT,
 PPPoE hızlandırma, WiFi 6 (160 MHz), WiFi hızlı yol, iki çekirdek, LED'ler,
 USB depolama ve ROM'da yaşayan kurtarma modu (`kurtar`) çalışıyor; günlük
-kullanımda 1000/50 PPPoE hatta test edildi. İlk kurulum seri konsol ister.
+kullanımda 1000/50 PPPoE hatta test edildi. İlk kurulum seri konsol ister; adım adım rehber ve tam yedek: [docs/KURULUM.md](docs/KURULUM.md).
 Bu imajda `apk upgrade` kullanmayın; güncelleme yeni imaj + `sysupgrade` ile
 yapılır.
 
