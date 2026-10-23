@@ -1,0 +1,29 @@
+#!/bin/sh
+# EN7523: all IRQs land on CPU0 (MSI affinity is not honoured), so keep the
+# ethernet NAPI on CPU0 and move the MT7916 (mt76) NAPI/TX threads to CPU1.
+# RPS stays off so a flow is not bounced between the two cores.
+# Measured 2026-09-27: WiFi download 773 -> ~920 Mbit/s, both cores busy.
+# GRO is switched off on the wired side: forwarded frames were merged by GRO
+# only to be split again by GSO for the MT7916 (no TSO), measured 2026-09-29
+# LAN->WiFi 4 streams 880 -> 937 Mbit/s, retransmits 5419 -> 2041.
+[ "$ACTION" = add ] || exit 0
+case "$INTERFACE" in
+eth0|lan[0-9]|wan|phy*-ap*) ;;
+*) exit 0 ;;
+esac
+(
+	sleep 5
+	for d in eth0 lan1 lan2 lan3 wan; do
+		ethtool -K "$d" gro off >/dev/null 2>&1
+	done
+	for p in $(ps | awk '/\[napi\/phy[0-9]-|\[mt76-tx/ {print $1}'); do
+		taskset -p -c 1 "$p" >/dev/null 2>&1
+	done
+	for p in $(ps | awk '/\[napi\/qdma_eth/ {print $1}'); do
+		taskset -p -c 0 "$p" >/dev/null 2>&1
+	done
+	for q in /sys/class/net/eth0/queues/rx-*/rps_cpus \
+		 /sys/class/net/phy*-ap*/queues/rx-*/rps_cpus; do
+		[ -w "$q" ] && echo 0 > "$q"
+	done
+) &

@@ -1,0 +1,85 @@
+#!/bin/sh
+# EX3501 apk guard (shadows /usr/bin/apk via PATH, LuCI uses it too).
+#
+# This image is a custom build: its kernel, drivers and base system are not
+# the ones in the downloads.openwrt.org repositories. On 2026-10-01 a single
+# `apk add --force-broken-world` purged 73 ROM packages (kernel, WiFi,
+# firewall, PPPoE). Before any change this wrapper therefore
+#   - refuses --force-* options and a blanket `apk upgrade`,
+#   - simulates the transaction and refuses it when it would remove, replace
+#     or downgrade a package of the ROM that was not named on the command line,
+#   - saves a `kurtar` snapshot, then runs the real apk.
+# Override (you know what you are doing): APK_GUARD=off apk ...
+
+REAL=/usr/bin/apk
+# Never removed/replaced through apk, even when named: they come with the
+# image (patched drivers, matching kernel) and are updated by sysupgrade.
+PROTECTED='kernel kmod-* base-files busybox procd* netifd ubus* ubox uci
+libuci* fstools libc libgcc* apk-* dropbear firewall4 nftables* wpad*
+hostapd* wifi-scripts ppp ppp-mod-pppoe mtd ucode* libubox* rpcd*'
+
+[ "$APK_GUARD" = off ] && exec $REAL "$@"
+
+cmd=
+for a in "$@"; do
+	case "$a" in -*) ;; *) cmd=$a; break ;; esac
+done
+case "$cmd" in
+add|del|upgrade|fix|cache) ;;
+*) exec $REAL "$@" ;;
+esac
+
+refuse() {
+	echo "apk-guard: REDDEDILDI: $*" >&2
+	echo "apk-guard: (bu imaj ozel derleme; zorla isterseniz: APK_GUARD=off apk ...)" >&2
+	exit 1
+}
+
+named=
+simulate=
+for a in "$@"; do
+	case "$a" in
+	--force-missing-repositories) ;;
+	--force-*|--no-scripts|--no-deps) refuse "$a secenegi sistem paketlerini silebilir" ;;
+	-s|--simulate) simulate=1 ;;
+	-*|"$cmd") ;;
+	*) named="$named ${a%%[<>=~]*}" ;;
+	esac
+done
+[ -n "$simulate" ] && exec $REAL "$@"
+[ "$cmd" = upgrade ] && [ -z "$named" ] &&
+	refuse "toplu 'apk upgrade' ROM'daki cekirdek/surucu ile uyumsuz paketler getirir; tek tek paket adi verin"
+
+if [ "$cmd" = del ]; then
+	for n in $named; do
+		for g in $PROTECTED; do
+			case "$n" in $g) refuse "$n korumali bir sistem paketi" ;; esac
+		done
+	done
+fi
+
+rom_pkgs=$(sed -n 's/^P://p' /rom/lib/apk/db/installed 2>/dev/null)
+out=$($REAL "$@" --simulate 2>&1)
+rc=$?
+if [ $rc -ne 0 ]; then
+	echo "$out" >&2
+	exit $rc
+fi
+
+bad=
+for p in $(echo "$out" | sed -En 's/^\([ 0-9\/]*\) (Purging|Removing|Replacing|Downgrading|Upgrading) ([^ ]+) .*/\1:\2/p'); do
+	act=${p%%:*}
+	pkg=${p#*:}
+	for g in $PROTECTED; do
+		case "$pkg" in $g) bad="$bad $act:$pkg(korumali)"; continue 2 ;; esac
+	done
+	case " $named " in *" $pkg "*) continue ;; esac
+	echo "$rom_pkgs" | grep -qx "$pkg" || [ "$act" = Purging ] || continue
+	bad="$bad $act:$pkg"
+done
+[ -n "$bad" ] && refuse "bu islem istenmeyen sistem degisikligi yapar:$bad"
+
+[ -n "$APK_GUARD_DRYRUN" ] && { echo "apk-guard: izin verilirdi: $REAL $*"; exit 0; }
+/usr/sbin/kurtar kaydet apk-oncesi >/dev/null 2>&1 &&
+	echo "apk-guard: kurtarma noktasi kaydedildi (kurtar liste)" >&2
+exec $REAL "$@"

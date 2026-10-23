@@ -1,0 +1,278 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: [PATCH] net: airoha: en7523: PPE fast path towards WiFi
+
+EN7523 has no PSE port towards WDMA, so flows leaving through a wireless
+device were never offloaded: PPPoE decap, NAT and forwarding of the WiFi
+download ran on the CPU (one core saturated at ~550-600 Mbit/s, ~100 ms
+latency under load).
+
+Do what the vendor hw_nat.ko does on this SoC (PpeSetForcePortInfoOffload:
+PSE port 0 for WLAN egress): bind such flows with the CDM1 (CPU) egress so
+the PPE performs VLAN/PPPoE removal, NAT and the L2 rewrite, and record the
+wireless egress device per FOE index. On RX, frames with PPE reason 0x16
+(hit bind, to CPU) whose FOE index maps to a wireless device are turned
+into an skb and handed straight to that device with dev_queue_xmit(),
+skipping GRO, bridge, routing and netfilter.
+
+Measured on a Zyxel EX3501-T0, 1000/50 PPPoE (VLAN 35), MT7916 at 160 MHz:
+WiFi download 544-605 -> 698 Mbit/s (Ookla), 857-954 Mbit/s at the radio,
+loaded latency 92-118 -> 35 ms. Needs mac80211 to resolve the forward path
+to the wireless netdev (see mac80211 patch 399).
+
+Module parameter en7523_wifi_fastpath: 0 off, 1 on (default), 2 debug.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -529,6 +529,11 @@
+ 	struct rhash_head node;
+ 	unsigned long cookie;
+ 
++	/* EN7523 WiFi fast path: egress net_device when the flow leaves
++	 * through a wireless interface (PPE delivers it to the CPU).
++	 */
++	struct net_device *fwd_dev;
++
+ 	/* Must be last --ends in a flexible-array member. */
+ 	struct airoha_foe_entry data;
+ };
+@@ -636,6 +641,9 @@
+ 	struct hlist_head *foe_flow;
+ 	u16 *foe_check_time;
+ 
++	/* EN7523 WiFi fast path: FOE index -> wireless egress device */
++	struct net_device __rcu **fwd_dev;
++
+ 	struct airoha_foe_stats *foe_stats;
+ 	dma_addr_t foe_stats_dma;
+ 
+@@ -794,6 +802,8 @@
+ void airoha_ppe_deinit(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+ u32 airoha_ppe_get_total_num_entries(struct airoha_ppe *ppe);
++struct net_device *airoha_ppe_en7523_fwd_dev(struct airoha_ppe *ppe, u32 hash);
++extern int en7523_wifi_fastpath;
+ struct airoha_foe_entry *airoha_ppe_foe_get_entry(struct airoha_ppe *ppe,
+ 						  u32 hash);
+ void airoha_ppe_foe_entry_get_stats(struct airoha_ppe *ppe, u32 hash,
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -963,6 +963,73 @@
+ 	return skb;
+ }
+ 
++/* EN7523 WiFi fast path (see airoha_ppe_foe_entry_prepare()): flows bound
++ * towards a wireless device reach the CPU with PPE reason 0x16 (hit bind,
++ * forward to CPU) already NATed, VLAN/PPPoE-stripped and L2-rewritten.
++ * Hand them straight to the wireless device, skipping GRO, bridging,
++ * routing and netfilter.
++ */
++#define AIROHA_EN7523_REASON_HIT_BIND_CPU	0x16
++
++int en7523_wifi_fastpath = 1;
++module_param(en7523_wifi_fastpath, int, 0644);
++MODULE_PARM_DESC(en7523_wifi_fastpath,
++		 "EN7523: 0 = off, 1 = hand PPE-bound WiFi flows to the WLAN device, 2 = 1 + log first frames");
++
++static bool airoha_en7523_rx_fastpath(struct airoha_queue *q,
++				      struct airoha_qdma_desc *desc,
++				      struct airoha_queue_entry *e, u32 len)
++{
++	struct airoha_eth *eth = q->qdma->eth;
++	u32 msg1 = le32_to_cpu(READ_ONCE(desc->msg1));
++	static atomic_t logged = ATOMIC_INIT(0);
++	struct net_device *fwd;
++	struct sk_buff *skb;
++	u32 hash, reason;
++
++	/* Only frames forwarded by a bound entry (reason 0x16, verified on
++	 * hardware) have been rewritten by the PPE; frames of the same flow
++	 * still queued from before the bind (e.g. reason 0x0f) carry the
++	 * original VLAN/PPPoE headers and must take the normal path.
++	 */
++	reason = FIELD_GET(AIROHA_RXD4_EN7523_PPE_CPU_REASON, msg1);
++	if (reason != AIROHA_EN7523_REASON_HIT_BIND_CPU)
++		return false;
++
++	hash = FIELD_GET(AIROHA_RXD4_EN7523_FOE_ENTRY, msg1);
++	if (hash == AIROHA_RXD4_EN7523_FOE_ENTRY)
++		return false;
++
++	fwd = airoha_ppe_en7523_fwd_dev(eth->ppe, hash);
++	if (!fwd || !netif_running(fwd) || len < ETH_HLEN)
++		return false;
++
++	if (en7523_wifi_fastpath == 2 && atomic_inc_return(&logged) <= 4) {
++		pr_info("en7523 fastpath: hash 0x%x reason 0x%x msg0 0x%08x msg1 0x%08x len %u\n",
++			hash, reason, le32_to_cpu(READ_ONCE(desc->msg0)),
++			msg1, len);
++		print_hex_dump(KERN_INFO, "en7523 fastpath: ",
++			       DUMP_PREFIX_OFFSET, 16, 1, e->buf,
++			       min_t(u32, len, 48), false);
++	}
++
++	skb = napi_build_skb(e->buf - AIROHA_RX_HEADROOM, q->buf_size);
++	if (!skb)
++		return false;
++
++	skb_reserve(skb, AIROHA_RX_HEADROOM);
++	__skb_put(skb, len);
++	skb_mark_for_recycle(skb);
++	skb_reset_mac_header(skb);
++	skb->protocol = eth_hdr(skb)->h_proto;
++	skb_set_network_header(skb, ETH_HLEN);
++	skb->dev = fwd;
++	skb_set_hash(skb, jhash_1word(hash, 0), PKT_HASH_TYPE_L4);
++	dev_queue_xmit(skb);
++
++	return true;
++}
++
+ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
+ {
+ 	enum dma_data_direction dir = page_pool_get_dma_dir(q->page_pool);
+@@ -1001,6 +1068,13 @@
+ 		dma_sync_single_for_cpu(eth->dev, e->dma_addr,
+ 					min_t(u32, len, e->dma_len), dir);
+ 
++		if (en7523_wifi_fastpath && airoha_is_7523(eth) && !q->skb &&
++		    !FIELD_GET(QDMA_DESC_MORE_MASK, desc_ctrl) &&
++		    airoha_en7523_rx_fastpath(q, desc, e, len)) {
++			done++;
++			continue;
++		}
++
+ 		dev = airoha_qdma_get_gdm_dev(eth, desc);
+ 		if (IS_ERR(dev))
+ 			goto free_frag;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -82,6 +82,15 @@
+ 	return PPE_SRAM_NUM_ENTRIES * eth->soc->num_ppe;
+ }
+ 
++/* Caller holds rcu_read_lock (NAPI context). */
++struct net_device *airoha_ppe_en7523_fwd_dev(struct airoha_ppe *ppe, u32 hash)
++{
++	if (!ppe->fwd_dev || hash >= airoha_ppe_get_total_num_entries(ppe))
++		return NULL;
++
++	return rcu_dereference(ppe->fwd_dev[hash]);
++}
++
+ u32 airoha_ppe_get_total_num_entries(struct airoha_ppe *ppe)
+ {
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+@@ -484,6 +493,15 @@
+ 						info.idx) |
+ 				     FIELD_PREP(AIROHA_FOE_MAC_WDMA_WCID,
+ 						info.wcid);
++		} else if (airoha_is_7523(eth) && netdev->ieee80211_ptr) {
++			/* EN7523 has no PSE path towards WDMA: bind the flow
++			 * anyway (NAT, VLAN/PPPoE decap and L2 rewrite done by
++			 * the PPE) and deliver it to the CPU through CDM1, where
++			 * airoha_eth hands it straight to the wireless device.
++			 * Same egress the vendor hw_nat.ko programs on this SoC.
++			 */
++			val |= FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT,
++					  FE_PSE_PORT_CDM1);
+ 		} else {
+ 			struct airoha_gdm_dev *dev = netdev_priv(netdev);
+ 			struct airoha_gdm_port *port;
+@@ -942,6 +960,8 @@
+ 
+ 	hlist_del_init(&e->list);
+ 	if (e->hash != 0xffff) {
++		if (ppe->fwd_dev)
++			RCU_INIT_POINTER(ppe->fwd_dev[e->hash], NULL);
+ 		e->data.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
+ 		e->data.ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,
+ 					  AIROHA_FOE_STATE_INVALID);
+@@ -1136,8 +1156,12 @@
+ 
+ 	lockdep_assert_held(&ppe_lock);
+ 
+-	if (!airoha_ppe_en7523_skb_tuple(skb, &t, &l4proto))
++	if (!airoha_ppe_en7523_skb_tuple(skb, &t, &l4proto)) {
++		if (en7523_wifi_fastpath == 2)
++			pr_info_ratelimited("en7523 fastpath: bind hash 0x%x: tuple parse failed proto 0x%04x\n",
++					    hash, ntohs(eth_hdr(skb)->h_proto));
+ 		return false;
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(types) && !commit_done; i++) {
+ 		u32 index;
+@@ -1155,9 +1179,19 @@
+ 			airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
+ 			commit_done = true;
+ 			e->hash = hash;
++			if (en7523_wifi_fastpath == 2 && e->fwd_dev)
++				pr_info_ratelimited("en7523 fastpath: bound hash 0x%x -> %s\n",
++						    hash, e->fwd_dev->name);
++			if (ppe->fwd_dev)
++				rcu_assign_pointer(ppe->fwd_dev[hash],
++						   e->fwd_dev);
+ 		}
+ 	}
+ 
++	if (!commit_done && en7523_wifi_fastpath == 2)
++		pr_info_ratelimited("en7523 fastpath: bind hash 0x%x: no flow for %pI4h:%u -> %pI4h:%u proto %u\n",
++				    hash, &t.src_ip, t.src_port, &t.dest_ip,
++				    t.dest_port, l4proto);
+ 	return commit_done;
+ }
+ 
+@@ -1467,6 +1501,9 @@
+ 
+ 	err = airoha_ppe_foe_entry_prepare(eth, &hwe, odev, offload_type,
+ 					   &data, l4proto, dsfield);
++	if (en7523_wifi_fastpath == 2 && odev && odev->ieee80211_ptr)
++		pr_info_ratelimited("en7523 fastpath: offload to %s type %d err %d\n",
++				    odev->name, offload_type, err);
+ 	if (err)
+ 		return err;
+ 
+@@ -1540,6 +1577,10 @@
+ 
+ 	e->cookie = f->cookie;
+ 	memcpy(&e->data, &hwe, sizeof(e->data));
++	if (airoha_is_7523(eth) && odev && odev->ieee80211_ptr) {
++		e->fwd_dev = odev;
++		dev_hold(odev);
++	}
+ 
+ 	err = airoha_ppe_foe_flow_commit_entry(eth->ppe, e);
+ 	if (err)
+@@ -1555,6 +1596,8 @@
+ remove_foe_entry:
+ 	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ free_entry:
++	if (e->fwd_dev)
++		dev_put(e->fwd_dev);
+ 	kfree(e);
+ 
+ 	return err;
+@@ -1573,6 +1616,10 @@
+ 	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ 	rhashtable_remove_fast(&eth->flow_table, &e->node,
+ 			       airoha_flow_table_params);
++	if (e->fwd_dev) {
++		synchronize_net();	/* RX fast path readers */
++		dev_put(e->fwd_dev);
++	}
+ 	kfree(e);
+ 
+ 	return 0;
+@@ -1896,6 +1943,13 @@
+ 	if (!ppe->foe)
+ 		return -ENOMEM;
+ 
++	if (airoha_is_7523(eth)) {
++		ppe->fwd_dev = devm_kcalloc(eth->dev, ppe_num_entries,
++					    sizeof(*ppe->fwd_dev), GFP_KERNEL);
++		if (!ppe->fwd_dev)
++			return -ENOMEM;
++	}
++
+ 	ppe->foe_flow = devm_kzalloc(eth->dev,
+ 				     ppe_num_entries * sizeof(*ppe->foe_flow),
+ 				     GFP_KERNEL);

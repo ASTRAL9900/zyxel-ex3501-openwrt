@@ -1,0 +1,393 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: net: airoha: ppe: EN7523 hardware NAT offload
+
+- no PPE SRAM on EN7523: 0 SRAM entries, DRAM table at REG_PPE_TB_BASE;
+- 64-byte FOE entries (same layout as the first 64 bytes of struct
+  airoha_foe_entry);
+- CPU-side PPE1 configuration from the stock firmware register dump
+  (flow types, TPID/ethertype lists, table config, aging, bind rate,
+  hash config, MTUs);
+- the tc flow-block path no longer requires an NPU object and flow
+  entries are committed without NPU statistics;
+- the PPE never writes unbind entries to DRAM, so bound flows are
+  matched against the received frame's IPv4 5-tuple and every committed
+  entry is also pushed into the PPE's internal store through the RAM
+  window (REG_PPE_RAM_CTRL/RAM_ENTRY).
+
+Result (Zyxel EX3501-T0, LAN client -> WAN through NAT, iperf3):
+895 / 940 / 938 Mbit/s (upload / download / 4 streams), sirq 0%,
+versus ~500 Mbit/s CPU-bound without the offload.
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -5,6 +5,8 @@
+  */
+ 
+ #include <linux/ip.h>
++#include <linux/udp.h>
++#include <net/dsa.h>
+ #include <linux/ipv6.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+@@ -65,6 +67,17 @@
+ {
+ 	struct airoha_eth *eth = ppe->eth;
+ 
++	/* EN7523 (hypothesis 34): no PPE SRAM table on this SoC -- vendor
++	 * hw_nat.ko only touches the SRAM window (REG_PPE_RAM_CTRL/ENTRY)
++	 * for HIR 10/12 parts.  With a non-zero SRAM count the driver read
++	 * every FOE index below 8K through those registers (garbage, seen
++	 * as 16 identical bogus "UNB L2B" entries in debugfs) and placed
++	 * the DRAM table at foe_dma + 8K entries, while REG_PPE_TB_BASE
++	 * points at foe_dma.
++	 */
++	if (airoha_is_7523(eth))
++		return 0;
++
+ 	return PPE_SRAM_NUM_ENTRIES * eth->soc->num_ppe;
+ }
+ 
+@@ -229,6 +242,101 @@
+ 	}
+ }
+ 
++/* EN7523 (hypothesis 34): CPU-side PPE1 table configuration.  Values come
++ * from vendor hw_nat.ko init_module()/PpeSetFoeEbl() (non HIR-10/12 path)
++ * and from the live register dump of the stock firmware:
++ * - REG_PPE_PPE_FLOW_CFG: IPv4 NAT/NAPT/frag, IPv6 3T/5T, L2 bridge, hash
++ *   options -- with this register at 0 the PPE reported NO_FLOW (0x07) for
++ *   every packet, TCP included (verified live on the Zyxel EX3501-T0).
++ * - REG_PPE_TB_CFG: classic layout, table size code in bits 2..0 (4 = 16K
++ *   entries), search-miss 3 (forward to CPU and build entry), aging
++ *   enabled for non-L4/unbind/TCP/UDP/TCP-FIN, keepalive off, hash mode 0.
++ *   Bits above 15 are left at their reset value.
++ * - Unbind age 1000 packets / 3 s, bind age 60 s (TCP-FIN 1 s), bind
++ *   limits 4000/4000/8000, bind rate 30 (vendor PpeSetBindThreshold).
++ * - REG_PPE_GLO_CFG = 0x00038743, the value the vendor firmware runs with.
++ * Live test with these written via /dev/mem: CRSN changed from NO_FLOW to
++ * HIT_UNBIND / HIT_UNBIND_RATE_REACHED with valid FOE indexes.
++ */
++void airoha_ppe_en7523_hw_init(struct airoha_eth *eth)
++{
++	struct airoha_ppe *ppe = eth->ppe;
++
++	airoha_fe_wr(eth, REG_PPE_TB_BASE(0), ppe->foe_dma);
++	airoha_fe_wr(eth, REG_PPE_HASH_SEED(0), PPE_HASH_SEED);
++
++	airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(0),
++		     PPE_FLOW_CFG_IP4_TCP_FRAG_MASK |
++		     PPE_FLOW_CFG_IP4_UDP_FRAG_MASK |
++		     PPE_FLOW_CFG_IP4_NAT_MASK | PPE_FLOW_CFG_IP4_NAPT_MASK |
++		     BIT(15) | PPE_FLOW_CFG_IP4_NAT_FRAG_MASK |
++		     PPE_FLOW_CFG_IP4_HASH_GRE_KEY_MASK |
++		     PPE_FLOW_CFG_IP6_HASH_GRE_KEY_MASK |
++		     BIT(21) | BIT(25) | BIT(26));
++
++	airoha_fe_rmw(eth, REG_PPE_TB_CFG(0), GENMASK(15, 0),
++		      FIELD_PREP(PPE_DRAM_TB_NUM_ENTRY_MASK,
++				 PPE_RAM_NUM_ENTRIES_SHIFT(PPE_DRAM_NUM_ENTRIES)) |
++		      FIELD_PREP(PPE_TB_CFG_SEARCH_MISS_MASK, 3) |
++		      PPE_TB_CFG_AGE_NON_L4_MASK |
++		      PPE_TB_CFG_AGE_UNBIND_MASK |
++		      PPE_TB_CFG_AGE_TCP_MASK |
++		      PPE_TB_CFG_AGE_UDP_MASK |
++		      PPE_TB_CFG_AGE_TCP_FIN_MASK);
++
++	airoha_fe_wr(eth, REG_PPE_UNBIND_AGE(0),
++		     FIELD_PREP(PPE_UNBIND_AGE_MIN_PACKETS_MASK, 1000) |
++		     FIELD_PREP(PPE_UNBIND_AGE_DELTA_MASK, 3));
++	airoha_fe_wr(eth, REG_PPE_BND_AGE0(0),
++		     FIELD_PREP(PPE_BIND_AGE0_DELTA_NON_L4, 60) |
++		     FIELD_PREP(PPE_BIND_AGE0_DELTA_UDP, 60));
++	airoha_fe_wr(eth, REG_PPE_BND_AGE1(0),
++		     FIELD_PREP(PPE_BIND_AGE1_DELTA_TCP_FIN, 1) |
++		     FIELD_PREP(PPE_BIND_AGE1_DELTA_TCP, 60));
++	airoha_fe_wr(eth, REG_PPE_BIND_LIMIT0(0),
++		     FIELD_PREP(PPE_BIND_LIMIT0_HALF_MASK, 4000) |
++		     FIELD_PREP(PPE_BIND_LIMIT0_QUARTER_MASK, 4000));
++	airoha_fe_wr(eth, REG_PPE_BIND_LIMIT1(0),
++		     FIELD_PREP(PPE_BIND_LIMIT1_NON_L4_MASK, 1) |
++		     FIELD_PREP(PPE_BIND_LIMIT1_FULL_MASK, 8000));
++	airoha_fe_wr(eth, REG_PPE_BIND_RATE(0),
++		     FIELD_PREP(PPE_BIND_RATE_L2B_BIND_MASK, 30) |
++		     FIELD_PREP(PPE_BIND_RATE_BIND_MASK, 30));
++
++	airoha_fe_rmw(eth, REG_PPE_DFT_CPORT(0, AIROHA_GDM1_IDX),
++		      DFT_CPORT_MASK(AIROHA_GDM1_IDX),
++		      __field_prep(DFT_CPORT_MASK(AIROHA_GDM1_IDX),
++				   FE_PSE_PORT_CDM1));
++
++	/* Values read live from the stock firmware (vendor/stock_regs.txt):
++	 * ethertype/TPID lists (without them the PPE never recognises a
++	 * VLAN or the 0x8100-format switch special tag), IP proto check,
++	 * misc parser config, hash config and MTUs (~2000, vendor
++	 * PpeSetLargePktSupport).
++	 */
++	airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(0), 0x06bbf7c0);
++	airoha_fe_wr(eth, REG_PPE_IP_PROTO_CHK(0), 0x000f000f);
++	airoha_fe_wr(eth, PPE1_BASE + 0x20c, 0x04291106);
++	airoha_fe_wr(eth, PPE1_BASE + 0x210, 0x00003a01);
++	airoha_fe_wr(eth, PPE1_BASE + 0x234, 0x01010001);
++	airoha_fe_wr(eth, REG_PPE_TB_HASH_CFG(0), 0x31003001);
++	airoha_fe_wr(eth, PPE1_BASE + 0x288, 0x001b077f);
++	airoha_fe_wr(eth, PPE1_BASE + 0x28c, 0x0100011b);
++	airoha_fe_wr(eth, PPE1_BASE + 0x2d0, 0x88a88100);	/* VLAN TPIDs */
++	airoha_fe_wr(eth, PPE1_BASE + 0x2d4, 0x08000000);	/* IPv4 */
++	airoha_fe_wr(eth, PPE1_BASE + 0x2d8, 0x000086dd);	/* IPv6 */
++	airoha_fe_wr(eth, PPE1_BASE + 0x2e0, 0x0000c021);	/* PPP IPv4 */
++	airoha_fe_wr(eth, PPE1_BASE + 0x304, 0x07d407d0);	/* MTUs ~2000 */
++	airoha_fe_wr(eth, PPE1_BASE + 0x308, 0x07dc07d8);
++	airoha_fe_wr(eth, PPE1_BASE + 0x30c, 0x07e407e0);
++	airoha_fe_wr(eth, PPE1_BASE + 0x310, 0x000007e8);
++	airoha_fe_wr(eth, PPE1_BASE + 0x318, 0x0000884c);
++	/* TB_CFG upper bits as on the stock firmware (keepalive kept off) */
++	airoha_fe_rmw(eth, REG_PPE_TB_CFG(0), GENMASK(31, 16), 0xef400000);
++
++	airoha_fe_wr(eth, REG_PPE_GLO_CFG(0), 0x00038743);
++}
++
+ static void airoha_ppe_flow_mangle_eth(const struct flow_action_entry *act, void *eth)
+ {
+ 	void *dest = eth + act->mangle.offset;
+@@ -716,7 +824,7 @@
+ 					      REG_PPE_RAM_ENTRY(ppe2, i));
+ 	}
+ 
+-	return ppe->foe + hash * sizeof(struct airoha_foe_entry);
++	return ppe->foe + hash * airoha_ppe_entry_size(ppe);
+ }
+ 
+ struct airoha_foe_entry *airoha_ppe_foe_get_entry(struct airoha_ppe *ppe,
+@@ -750,12 +858,14 @@
+ 
+ static int airoha_ppe_foe_commit_sram_entry(struct airoha_ppe *ppe, u32 hash)
+ {
+-	struct airoha_foe_entry *hwe = ppe->foe + hash * sizeof(*hwe);
+-	bool ppe2 = hash >= PPE_SRAM_NUM_ENTRIES;
++	u32 entry_size = airoha_ppe_entry_size(ppe);
++	struct airoha_foe_entry *hwe = ppe->foe + hash * entry_size;
++	bool ppe2 = !airoha_is_7523(ppe->eth) && hash >= PPE_SRAM_NUM_ENTRIES;
+ 	u32 *ptr = (u32 *)hwe, val;
+ 	int i;
+ 
+-	for (i = 0; i < sizeof(*hwe) / sizeof(*ptr); i++)
++	/* EN7523: 64-byte entries, the RAM window is 16 words */
++	for (i = 0; i < entry_size / sizeof(*ptr); i++)
+ 		airoha_fe_wr(ppe->eth, REG_PPE_RAM_ENTRY(ppe2, i), ptr[i]);
+ 
+ 	wmb();
+@@ -774,13 +884,14 @@
+ 				       u32 hash, bool rx_wlan)
+ {
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+-	struct airoha_foe_entry *hwe = ppe->foe + hash * sizeof(*hwe);
++	u32 entry_size = airoha_ppe_entry_size(ppe);
++	struct airoha_foe_entry *hwe = ppe->foe + hash * entry_size;
+ 	u32 ts = airoha_ppe_get_timestamp(ppe);
+ 	struct airoha_eth *eth = ppe->eth;
+ 	struct airoha_npu *npu;
+ 	int err = 0;
+ 
+-	memcpy(&hwe->d, &e->d, sizeof(*hwe) - sizeof(hwe->ib1));
++	memcpy(&hwe->d, &e->d, entry_size - sizeof(hwe->ib1));
+ 	wmb();
+ 
+ 	e->ib1 &= ~AIROHA_FOE_IB1_BIND_TIMESTAMP;
+@@ -791,14 +902,31 @@
+ 
+ 	npu = rcu_dereference(eth->npu);
+ 	if (!npu) {
+-		err = -ENODEV;
+-		goto unlock;
+-	}
+-
+-	if (!rx_wlan)
++		/* EN7523 (hypothesis 33): there is no airoha_npu object on
++		 * this SoC (the NPU is booted directly by airoha_eth and the
++		 * PPE was initialised by the CPU), yet the FOE table is DRAM
++		 * written above by the CPU and the SRAM commit below is a
++		 * plain register write -- the NPU is only needed for flow
++		 * statistics. Without this, every flow offload failed with
++		 * -ENODEV and hardware NAT never engaged (verified live:
++		 * flowtable had "flags offload", ppe/entries stayed empty).
++		 */
++		if (eth->soc->version != 0x7523) {
++			err = -ENODEV;
++			goto unlock;
++		}
++	} else if (!rx_wlan) {
+ 		airoha_ppe_foe_flow_stats_update(ppe, npu, hwe, hash);
++	}
+ 
+-	if (hash < sram_num_entries)
++	/* EN7523 (hypothesis 34, verified live): the PPE does its lookups
++	 * from its internal entry store and never fetches the DRAM table
++	 * (nor writes unbind entries to it -- RAM_CTRL/RAM_ENTRY reads show
++	 * the hardware's own copy).  Push every committed entry (bind and
++	 * invalidate) through the RAM window as well; with this NAT went from
++	 * ~500 to ~930 Mbit/s with sirq at 0%.
++	 */
++	if (hash < sram_num_entries || airoha_is_7523(eth))
+ 		err = airoha_ppe_foe_commit_sram_entry(ppe, hash);
+ unlock:
+ 	rcu_read_unlock();
+@@ -901,6 +1029,124 @@
+ 	return 0;
+ }
+ 
++/* EN7523 (hypothesis 34): the PPE reports HIT_UNBIND_RATE_REACHED with a
++ * valid FOE index but never writes the unbind entry (tuple) into the DRAM
++ * table -- the table stays all-zero (verified with debugfs ppe/raw64 and
++ * /dev/mem scans after 30k RATE_REACHED events).  Vendor hw_nat.ko does not
++ * depend on it either: PpeTxHandler() builds the whole entry from the skb
++ * (PpeParseLayerInfo/PpeFillInL2Info/L3Info/L4Info) and then sets the bind
++ * state.  Do the same: parse the IPv4 5-tuple from the received frame and
++ * match it against the flow table instead of comparing with the (empty)
++ * hardware entry.  The frame at skb->data still carries the in-band 4-byte
++ * MT7530 special tag (hypothesis 30) before the ethertype.
++ */
++static bool airoha_ppe_en7523_skb_tuple(struct sk_buff *skb,
++					struct airoha_foe_ipv4_tuple *t,
++					u8 *l4proto)
++{
++	const struct udphdr *uh;
++	const struct iphdr *iph;
++	const u8 *p = skb->data;
++	int room = skb_headlen(skb);
++	__be16 proto;
++
++	/* eth_type_trans() already pulled the MAC header; read the real
++	 * ethertype from it (skb->protocol is ETH_P_XDSA on a DSA conduit).
++	 */
++	proto = eth_hdr(skb)->h_proto;
++	if (proto == htons(ETH_P_8021Q)) {
++		if (room < 4)
++			return false;
++		proto = get_unaligned((const __be16 *)(p + 2));
++		p += 4;
++		room -= 4;
++	}
++	if (proto != htons(ETH_P_IP) || room < (int)sizeof(*iph))
++		return false;
++
++	iph = (const struct iphdr *)p;
++	if (iph->version != 4 || iph->ihl < 5 || room < iph->ihl * 4 + 4)
++		return false;
++
++	*l4proto = iph->protocol;
++	t->src_ip = ntohl(iph->saddr);
++	t->dest_ip = ntohl(iph->daddr);
++	if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
++		uh = (const struct udphdr *)(p + iph->ihl * 4);
++		t->src_port = ntohs(uh->source);
++		t->dest_port = ntohs(uh->dest);
++	} else {
++		t->ports = 0xa5a5a500 | iph->protocol;
++	}
++
++	return true;
++}
++
++static bool airoha_ppe_en7523_flow_match(struct airoha_flow_table_entry *e,
++					 const struct airoha_foe_ipv4_tuple *t,
++					 u8 l4proto)
++{
++	int type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, e->data.ib1);
++	const struct airoha_foe_ipv4_tuple *o = &e->data.ipv4.orig_tuple;
++	bool udp = !!(e->data.ib1 & AIROHA_FOE_IB1_BIND_UDP);
++
++	if (e->type != FLOW_TYPE_L4)
++		return false;
++	if (type != PPE_PKT_TYPE_IPV4_HNAPT && type != PPE_PKT_TYPE_IPV4_ROUTE)
++		return false;
++	if (o->src_ip != t->src_ip || o->dest_ip != t->dest_ip)
++		return false;
++	if (type == PPE_PKT_TYPE_IPV4_HNAPT) {
++		if (l4proto != (udp ? IPPROTO_UDP : IPPROTO_TCP))
++			return false;
++		return o->src_port == t->src_port &&
++		       o->dest_port == t->dest_port;
++	}
++
++	return o->ports == t->ports;
++}
++
++static bool airoha_ppe_en7523_insert_entry(struct airoha_ppe *ppe,
++					   struct sk_buff *skb, u32 hash,
++					   bool rx_wlan)
++{
++	static const int types[] = { PPE_PKT_TYPE_IPV4_HNAPT,
++				     PPE_PKT_TYPE_IPV4_ROUTE };
++	struct airoha_foe_ipv4_tuple t = {};
++	struct airoha_flow_table_entry *e;
++	struct airoha_foe_entry tmp = {};
++	bool commit_done = false;
++	struct hlist_node *n;
++	u8 l4proto;
++	int i;
++
++	lockdep_assert_held(&ppe_lock);
++
++	if (!airoha_ppe_en7523_skb_tuple(skb, &t, &l4proto))
++		return false;
++
++	for (i = 0; i < ARRAY_SIZE(types) && !commit_done; i++) {
++		u32 index;
++
++		tmp.ib1 = FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, types[i]);
++		tmp.ipv4.orig_tuple = t;
++		if (types[i] == PPE_PKT_TYPE_IPV4_ROUTE)
++			tmp.ipv4.orig_tuple.ports = 0xa5a5a500 | l4proto;
++		index = airoha_ppe_foe_get_entry_hash(ppe, &tmp);
++
++		hlist_for_each_entry_safe(e, n, &ppe->foe_flow[index], list) {
++			if (!airoha_ppe_en7523_flow_match(e, &t, l4proto))
++				continue;
++
++			airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
++			commit_done = true;
++			e->hash = hash;
++		}
++	}
++
++	return commit_done;
++}
++
+ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 					struct sk_buff *skb,
+ 					u32 hash, bool rx_wlan)
+@@ -922,6 +1168,12 @@
+ 	if (state == AIROHA_FOE_STATE_BIND)
+ 		goto unlock;
+ 
++	if (airoha_is_7523(ppe->eth)) {
++		/* hwe is never written by the EN7523 PPE, match the skb */
++		airoha_ppe_en7523_insert_entry(ppe, skb, hash, rx_wlan);
++		goto unlock;
++	}
++
+ 	index = airoha_ppe_foe_get_entry_hash(ppe, hwe);
+ 	hlist_for_each_entry_safe(e, n, &ppe->foe_flow[index], list) {
+ 		if (e->type == FLOW_TYPE_L2_SUBFLOW) {
+@@ -1498,7 +1750,12 @@
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 
+-	if (!eth->npu)
++	/* EN7523 (hypothesis 34): no airoha_npu object exists and the PPE is
++	 * configured from the CPU (airoha_ppe_en7523_hw_init), so do not try
++	 * to obtain the NPU here -- it fails and every flow offload command
++	 * was being rejected (conntrack showed [OFFLOAD], never [HW_OFFLOAD]).
++	 */
++	if (!eth->npu && !airoha_is_7523(eth))
+ 		err = airoha_ppe_offload_setup(eth);
+ 	if (!err)
+ 		err = airoha_ppe_flow_offload_cmd(eth, type_data);
+@@ -1619,7 +1876,7 @@
+ 	eth->ppe = ppe;
+ 
+ 	ppe_num_entries = airoha_ppe_get_total_num_entries(ppe);
+-	foe_size = ppe_num_entries * sizeof(struct airoha_foe_entry);
++	foe_size = ppe_num_entries * airoha_ppe_entry_size(ppe);
+ 	ppe->foe = dmam_alloc_coherent(eth->dev, foe_size, &ppe->foe_dma,
+ 				       GFP_KERNEL);
+ 	if (!ppe->foe)

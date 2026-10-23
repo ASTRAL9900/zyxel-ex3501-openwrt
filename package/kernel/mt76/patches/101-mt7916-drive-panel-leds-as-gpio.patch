@@ -1,0 +1,94 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: [PATCH] mt76: mt7915: drive MT7916 panel LEDs as GPIO14/15
+
+On the Zyxel EX3501-T0 the 2.4 GHz and 5 GHz panel LEDs hang off MT7916
+GPIO14 and GPIO15 (active low). The vendor driver (mt7916_ap.ko LED table:
+2G -> GPIO14, 5G -> GPIO15, WPS -> GPIO16) drives them as plain GPIOs
+(pinmux function 5). Routing the LED_TOP controller to these pins (mux
+function 3, what mt76 did) never lights them, and mt76 left the mux at 0.
+
+For MT7916, set GPIO14/15 to GPIO mode as outputs and implement
+brightness_set by toggling the output bit; drop blink_set so the LED core
+blinks in software for the tpt triggers. Verified on hardware: each LED
+follows its GPIO, low = on.
+
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -271,9 +271,49 @@
+ 	return 0;
+ }
+ 
++/*
++ * MT7916 boards (e.g. Zyxel EX3501-T0) wire the per-band panel LEDs to
++ * GPIO14 (band 0, 2.4 GHz) and GPIO15 (band 1, 5 GHz), active low, and the
++ * vendor driver drives them as plain GPIOs: pinmux function 5 in
++ * MT_LED_GPIO_MUX1, output enable in 0x70004030, output data in 0x70004020.
++ * The LED_TOP controller path does not reach these pins, so drive the GPIO
++ * directly and let the LED core do (software) blinking.
++ */
++#define MT7916_GPIO_DOUT		0x70004020
++#define MT7916_GPIO_OE			0x70004030
++#define MT7916_LED_GPIO(_band)		(14 + (_band))
++
++static void mt7916_led_gpio_set(struct mt7915_dev *dev, u8 band, bool on)
++{
++	u32 bit = BIT(MT7916_LED_GPIO(band));
++
++	/* The WM firmware reset at cold boot clears the GPIO block after
++	 * mt7915_init_led_mux() ran, so (re)assert GPIO mode and output
++	 * enable on every update; this is cheap at LED blink rates.
++	 */
++	mt76_rmw(dev, MT_LED_GPIO_MUX1, GENMASK(27, 24) << (4 * band),
++		 5 << (24 + 4 * band));
++	mt76_set(dev, MT7916_GPIO_OE, bit);
++
++	if (on)
++		mt76_clear(dev, MT7916_GPIO_DOUT, bit);	/* active low */
++	else
++		mt76_set(dev, MT7916_GPIO_DOUT, bit);
++}
++
+ static void mt7915_led_set_brightness(struct led_classdev *led_cdev,
+ 				      enum led_brightness brightness)
+ {
++	struct mt76_phy *mphy = container_of(led_cdev, struct mt76_phy,
++					     leds.cdev);
++	struct mt7915_dev *dev = container_of(mphy->dev, struct mt7915_dev,
++					      mt76);
++
++	if (is_mt7916(&dev->mt76)) {
++		mt7916_led_gpio_set(dev, mphy->band_idx, brightness);
++		return;
++	}
++
+ 	if (!brightness)
+ 		mt7915_led_set_config(led_cdev, 0, 0xff);
+ 	else
+@@ -479,7 +519,9 @@
+ 	/* init led callbacks */
+ 	if (IS_ENABLED(CONFIG_MT76_LEDS)) {
+ 		mphy->leds.cdev.brightness_set = mt7915_led_set_brightness;
+-		mphy->leds.cdev.blink_set = mt7915_led_set_blink;
++		/* MT7916 LEDs are plain GPIOs: software blinking */
++		if (!is_mt7916(&phy->dev->mt76))
++			mphy->leds.cdev.blink_set = mt7915_led_set_blink;
+ 	}
+ }
+ 
+@@ -575,10 +617,14 @@
+ 				       GENMASK(11, 8), 1);
+ 			break;
+ 		case 0x7916:
++			/* GPIO14/15 as GPIO outputs; the level is owned by
++			 * mt7916_led_gpio_set() (LED core state)
++			 */
+ 			mt76_rmw_field(dev, MT_LED_GPIO_MUX1,
+-				       GENMASK(27, 24), 3);
++				       GENMASK(27, 24), 5);
+ 			mt76_rmw_field(dev, MT_LED_GPIO_MUX1,
+-				       GENMASK(31, 28), 3);
++				       GENMASK(31, 28), 5);
++			mt76_set(dev, MT7916_GPIO_OE, BIT(14) | BIT(15));
+ 			break;
+ 		default:
+ 			break;

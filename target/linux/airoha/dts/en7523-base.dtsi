@@ -1,0 +1,561 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+
+/*
+ * Chip-wide EN7523 blocks that are not (yet) part of upstream en7523.dtsi.
+ *
+ * Everything in this file is disabled by default; boards opt in to the
+ * pieces they actually use in their own device .dts.
+ *
+ * Register addresses and interrupt numbers below are cross-checked against
+ * a device tree extracted from a running EN7523 board (real.dts) and,
+ * where the IP block is shared, against an7581.dtsi in this same tree --
+ * the "eth" node's reg ranges and all 10 interrupt numbers match an7581's
+ * FE/QDMA block byte for byte, which is good evidence it is the same IP.
+ *
+ * IMPORTANT: the mainline Airoha ethernet driver
+ * (drivers/net/ethernet/airoha/airoha_eth.c) only knows about
+ * "airoha,en7581-eth" and "airoha,an7583-eth" in its of_device_id table --
+ * there is no "airoha,en7523-eth" match_data yet, upstream or in this
+ * tree's local patches. The eth/gdm nodes below are left status =
+ * "disabled" and will NOT probe as-is; they exist as scaffolding for once
+ * EN7523 match_data (soc_data with the right reset/queue counts) is added
+ * to the driver, either upstream or via a local patch. Do not flip them to
+ * "okay" before that lands.
+ *
+ * USB PHY: first attempt relied on the bootloader having initialized the
+ * PHY -- real-hardware result (2026-09-25): xhci-mtk probes fine, both root
+ * hubs enumerate (USB2 480M + USB3.2), usb-storage loads, but a plugged
+ * flash drive is never detected -- the PHY really is down. The tree carries
+ * an AN7581 USB PHY driver ("airoha,an7581-usb-phy", phy-airoha-usb.c) and
+ * the EN7523 PHY block at 0x1fac0000 reads back as real registers via
+ * /dev/mem (0x641e1300 at +0, live bank values at +0x700, no 0xdeadbeef in
+ * the 64K span), matching AN7581's usb0_phy address exactly. So try the
+ * AN7581 driver USB2-only: "airoha,usb2-monitor-clk-sel" is the only
+ * mandatory property; USB3 needs "airoha,serdes-port" + SCU syscon (AN7581
+ * SCU layout, NOT EN7523's -- deliberately omitted here, so the driver
+ * skips registering the USB3 instance).
+ */
+
+#include <dt-bindings/phy/phy.h>
+#include "en7523.dtsi"
+
+/ {
+	reserved-memory {
+		/*
+		 * EXPERIMENTAL: candidate fix for the "QDMA RX descriptor
+		 * DONE bit never gets set" bug exhaustively characterized on
+		 * real EN7523 hardware this session -- see the long comment
+		 * on eth_ring_buf's "memory-region" property on the eth node
+		 * below for the full writeup of what was ruled out first
+		 * (IRQ routing, ring count, descriptor bit layout, ring base
+		 * address programming, RX_CPU_IDX doorbell) and why this is
+		 * the one remaining untested hypothesis: that EN7523's QDMA
+		 * write-back engine can only actually complete DMA writes
+		 * into a specific pre-approved physical window, silently
+		 * dropping (not erroring) writes outside it while its own
+		 * internal producer-index register still advances as if
+		 * nothing were wrong -- exactly matching the observed
+		 * "RX_DMA_IDX moves, descriptor memory never changes"
+		 * symptom. Placed right after the existing NPU reservations
+		 * (which end at 0x86dfffff) with plenty of headroom before
+		 * the next used address, non-overlapping by construction.
+		 */
+		eth_ring_buf: eth-ring-buf@86e00000 {
+			/*
+			 * 16MB: generous margin over the driver's actual
+			 * coherent DMA footprint on this device once this
+			 * region is declared (RX/TX ring descriptors are
+			 * modest -- ~100KB total -- but
+			 * airoha_qdma_init_hfwd_queues()'s forward-buffer
+			 * pools, which fall back to the same device-wide
+			 * coherent allocator here since no
+			 * "qdma0-buf"/"qdma1-buf" named region is declared,
+			 * alone need ~6MB: HW_DSCP_NUM(2048) *
+			 * AIROHA_MAX_PACKET_SIZE(2048) for qdma0 + .../2 for
+			 * qdma1). Running out mid-probe would fail
+			 * dmam_alloc_coherent() and break probe entirely, a
+			 * much worse outcome than the bug this is trying to
+			 * fix, so this errs well on the generous side --
+			 * cost is negligible given ~390MB of completely free
+			 * RAM in this address range.
+			 */
+			compatible = "shared-dma-pool";
+			no-map;
+			reg = <0x86e00000 0x01000000>;
+		};
+
+		/*
+		 * FIX candidate (hypothesis 17a, real-hardware evidence from
+		 * live SSH register introspection of the vendor's real,
+		 * working stock firmware): the vendor's live REG_LMGR_INIT_CFG
+		 * has HW_FWD_DESC_NUM = 16384, 8x this driver's hardcoded
+		 * HW_DSCP_NUM (2048). Blindly bumping that constant broke
+		 * probe outright on this board (confirmed: "airoha_eth ...:
+		 * probe with driver airoha_eth failed with error -12" /
+		 * ENOMEM) because airoha_qdma_init_hfwd_queues()'s fallback
+		 * path (taken because no "qdma0-buf"/"qdma1-buf" named
+		 * memory-region existed) tries one raw dmam_alloc_coherent()
+		 * of `buf_size * num_desc` bytes -- 32MB for qdma0 alone at
+		 * 16384 -- which the generic allocator cannot satisfy as one
+		 * contiguous chunk on this 512MB board. These two named
+		 * regions give that same allocation a pre-reserved, always-
+		 * satisfiable physical window instead, matching the vendor's
+		 * own DTS structure (an7581.dtsi has the same two named
+		 * regions for the same purpose). Sized for
+		 * HW_DSCP_NUM=16384: qdma0's buf_size is AIROHA_MAX_PACKET_SIZE
+		 * (2048), so 16384*2048 = 32MB; qdma1's is that halved (1024),
+		 * so 16384*1024 = 16MB. Placed right after eth_ring_buf (ends
+		 * 0x87dfffff), non-overlapping, well within the ~388MB of
+		 * otherwise-free RAM in this address range.
+		 */
+		qdma0_buf: qdma0-buf@87e00000 {
+			compatible = "shared-dma-pool";
+			no-map;
+			reg = <0x87e00000 0x02000000>;
+		};
+
+		qdma1_buf: qdma1-buf@89e00000 {
+			compatible = "shared-dma-pool";
+			no-map;
+			reg = <0x89e00000 0x01000000>;
+		};
+	};
+
+	usb0: usb@1fab0000 {
+		compatible = "mediatek,mtk-xhci";
+		reg = <0x1fab0000 0x3e00>,
+		      <0x1fab3e00 0x100>;
+		reg-names = "mac", "ippc";
+		interrupts = <GIC_SPI 33 IRQ_TYPE_LEVEL_HIGH>;
+
+		phys = <&usb0_phy PHY_TYPE_USB2>;
+
+		status = "disabled";
+	};
+
+	usb0_phy: phy@1fad0000 {
+		compatible = "airoha,en7523-usb-phy";
+		/* vendor: usb_phy@1fad0000, 0x1fff (0x1fac0000 aliases it) */
+		reg = <0x1fad0000 0x2000>;
+
+		/* USB2-only: no airoha,serdes-port / airoha,scu on purpose
+		 * (those describe AN7581's SCU). Two USB2 port banks; the
+		 * monitor clock for bank N is N (vendor u2_slew_rate_cal_7523),
+		 * so start at 0. The EX3501-T0 connector is on bank 1.
+		 */
+		airoha,usb2-monitor-clk-sel = <0>;
+
+		#phy-cells = <1>;
+	};
+
+	/*
+	 * FE + dual QDMA rings, matching real.dts frame_engine@1fb50000's
+	 * first two reg ranges (0x1fb50000/0x2600 and 0x1fb54000/0x4000).
+	 * airoha_eth.c unconditionally ioremaps both "qdma0" and "qdma1"
+	 * by name (AIROHA_MAX_NUM_QDMA=2, hardcoded, not soc_data-gated --
+	 * confirmed by reading the driver source) and uses them for
+	 * genuinely different purposes (qdma[0] vs qdma[1] selected per
+	 * netdev by airoha_is_lan_gdm_dev()), so this isn't optional. Our
+	 * own an7581.dtsi in this tree already has the working reference
+	 * split for this exact block: fe/qdma0/qdma1 at 0x1fb50000/0x2600,
+	 * 0x1fb54000/0x2000, 0x1fb56000/0x2000 respectively -- i.e. the
+	 * vendor's single combined 0x1fb54000/0x4000 range here is exactly
+	 * qdma0+qdma1 back to back (0x2000+0x2000), split below to match.
+	 *
+	 * The third range in the vendor node (0x1fb58000/0x8000, the GSW
+	 * switch block) is modeled separately below as switch@1fb58000,
+	 * not as part of this reg/interrupts list -- see that node's own
+	 * comment for why it carries no interrupt properties.
+	 */
+	eth: ethernet@1fb50000 {
+		compatible = "airoha,en7523-eth", "airoha,en7581-eth";
+		reg = <0x1fb50000 0x2600>,
+		      <0x1fb54000 0x2000>,
+		      <0x1fb56000 0x2000>;
+		reg-names = "fe", "qdma0", "qdma1";
+
+		/*
+		 * FIX candidate (RX ring bug investigation): EN7523_GDMA_RST
+		 * (bit 28, a real, documented mainline reset-controller
+		 * constant -- include/dt-bindings/reset/airoha,en7523-reset.h)
+		 * was never listed here before. Discovered via live SSH
+		 * introspection of the vendor's real, working stock firmware:
+		 * its devicetree has a separate econet,ecnt-gdma node at
+		 * 0x1fb30000 with no "interrupts" property of its own, and
+		 * /proc/interrupts shows a real, traffic-driven interrupt
+		 * ("qdma_lan_int1", GIC SPI 69) that fires 1:1 with real LAN
+		 * RX traffic -- proven by a live before/after diff across a
+		 * real ping burst (+313 fires, zero on every genuinely idle
+		 * line) -- yet SPI 69 does not appear anywhere in this node's
+		 * own (independently confirmed byte-for-byte correct against
+		 * the vendor's live DT) interrupts list. This "gdma" hardware
+		 * block matches Ghidra strings found in the vendor's kernel
+		 * binary earlier this investigation (GET_GDMA_DA/SA,
+		 * SET_GDMA_CT0, IS_GDMA_DONE) suggesting a frame
+		 * classification/DA-SA-extraction stage sitting between FE
+		 * and QDMA in the RX pipeline. Our devicetree has never had
+		 * any node at all for 0x1fb30000, so this reset line has
+		 * never been deasserted -- if this block defaults to
+		 * held-in-reset at power-on (the usual default for SoC reset
+		 * bits) and genuinely sits between FE and QDMA, that would
+		 * fully explain the whole investigation's symptom: FE MIB
+		 * counters count real frames correctly, but nothing ever
+		 * reaches QDMA descriptor memory. Testing whether deasserting
+		 * it (added to the same eth->rsts bulk array as fe/pdma/qdma
+		 * in airoha_eth.c, asserted+deasserted at the same point in
+		 * airoha_hw_init()) unblocks RX completion.
+		 */
+		resets = <&scu EN7523_FE_RST>,
+			 <&scu EN7523_FE_PDMA_RST>,
+			 <&scu EN7523_FE_QDMA_RST>,
+			 <&scu EN7523_GDMA_RST>,
+			 <&scu EN7523_XSI_MAC_RST>,
+			 <&scu EN7523_DUAL_HSI0_MAC_RST>,
+			 <&scu EN7523_DUAL_HSI1_MAC_RST>,
+			 <&scu EN7523_HSI_MAC_RST>;
+		reset-names = "fe", "pdma", "qdma", "gdma", "xsi-mac",
+			      "hsi0-mac", "hsi1-mac", "hsi-mac";
+
+		/*
+		 * FIX candidate (hypothesis 24): live vendor /proc/interrupts
+		 * on the real, working stock firmware shows the ENTIRE list
+		 * below (37,55,56,57,38,58,59,60,49,64 -- independently
+		 * confirmed byte-for-byte identical to the vendor's own live
+		 * devicetree for this exact node) never appears as a
+		 * registered/active interrupt anywhere: none of these SPI
+		 * numbers show up in vendor's /proc/interrupts at all, under
+		 * any name, with any count. Vendor's real QDMA driver
+		 * (qdma_lan.ko) instead registers on entirely different GIC
+		 * SPIs via a legacy, non-DT get_qdma_lan_irq()/
+		 * request_threaded_irq() path (traced this session via live
+		 * SSH + raw ARM disassembly of the running kernel, calibrated
+		 * against known-good kallsyms addresses -- no Ghidra
+		 * available this session): qdma_lan_int1/2/3 = SPI 69/87/88
+		 * (IRQ 98/99/100), confirmed traffic-correlated (+313, +626
+		 * fires across independent real ping bursts vs. permanently
+		 * zero on every genuinely idle line) -- and qdma_wan_int1-4 =
+		 * SPI 70/90/91/92 (IRQ 102-105), a perfect 4-entry match for
+		 * this node's own AIROHA_MAX_NUM_IRQ_BANKS=4-per-instance
+		 * platform_get_irq(pdev, 4*id+i) scheme. This driver's own
+		 * airoha_irq_handler() has never fired for real QDMA RX
+		 * activity across the whole investigation (hypothesis 1,
+		 * "IRQ signal/routing problem", ruled out at the time only
+		 * because FE's MIB counters were independently confirmed
+		 * live) -- consistent with it listening on GIC lines real
+		 * silicon never asserts for this purpose on this SoC. Testing
+		 * the real, vendor-confirmed numbers directly, in the same
+		 * bank order/position this driver already expects. The LAN
+		 * side only has 3 confirmed-live names for 4 needed slots;
+		 * the 4th reuses SPI 150 ("rxdone0" in vendor's table --
+		 * zero count there too, but the single closest remaining
+		 * named candidate to "RX done" semantics). Low risk either
+		 * way: devm_request_irq() here already passes IRQF_SHARED,
+		 * and no other OpenWrt driver claims any of these lines.
+		 *
+		 * REAL-HARDWARE TESTED, REFUTED (2026-09-22): boots clean,
+		 * all 10 devm_request_irq() calls succeed, real traffic
+		 * confirmed (rx_packets 27->84 across the test window with
+		 * real ARP broadcasts sent), but airoha_rxring_dump
+		 * before/after was still byte-for-byte identical and zero
+		 * "done=1" descriptors -- identical null result to every
+		 * other hypothesis. Notably, dmesg showed *zero* DIAG-IRQ
+		 * lines at all this run (every prior test, using the
+		 * original 37/55/56/57/... numbers below, showed at least
+		 * one benign startup interrupt) -- these real, vendor-
+		 * confirmed SPI numbers produced no observable interrupt
+		 * activity whatsoever under this driver/GIC configuration.
+		 * Reverted back to the original list below, which remains
+		 * independently confirmed byte-for-byte correct against
+		 * vendor's own live DT for this exact node (it just does
+		 * not correspond to vendor's real, legacy-registered QDMA
+		 * completion IRQs). See en7523_rx_ring_bug_status.md,
+		 * hypothesis 24.
+		 */
+		interrupts = <GIC_SPI 37 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 55 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 56 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 57 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 38 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 60 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
+
+		/*
+		 * EXPERIMENTAL, unverified: candidate fix for the "QDMA RX
+		 * descriptor DONE bit never gets set" bug. Exhaustively
+		 * characterized on real EN7523 hardware this session via a
+		 * debugfs raw-ring-memory + register-readback diagnostic
+		 * suite; every cheaper hypothesis was ruled out first:
+		 *
+		 *   - IRQ routing/signal: /proc/interrupts shows all RX IRQ
+		 *     banks permanently at 0, confirmed across dozens of
+		 *     real pings, while the FE MAC's own GDM1 RX MIB counters
+		 *     (REG_FE_GDM_RX_OK_PKT_CNT_L etc.) DO increment with
+		 *     zero drops -- frames really are accepted upstream.
+		 *   - RX ring count (32 vs a hypothesized real EN7523 limit
+		 *     of 16): capping init at 16 rings changed nothing.
+		 *   - Wrong ring/qdma instance: dumped ALL rings in BOTH
+		 *     qdma[0] and qdma[1], all show the same symptom.
+		 *   - Descriptor bit layout/field width: the complete 8-word
+		 *     struct airoha_qdma_desc (tcp_ts_reply/ctrl/addr/data/
+		 *     msg0-3) is byte-for-byte (cmp -l) identical before/
+		 *     after real traffic to the driver's own initial
+		 *     software write -- no hardware-touched field anywhere,
+		 *     in any position.
+		 *   - Wrong register offsets: REG_RX_RING_BASE write+readback
+		 *     MATCHes on all 32 rings; a "legacy register window at
+		 *     0x0800" hypothesis was independently tried and matches
+		 *     a real upstream finding (openwrt/openwrt#20104,
+		 *     930-73/930-75) that reverted the exact same idea after
+		 *     it returned 0xdeadbeef-style sentinel values.
+		 *   - Dead/unbacked RX_DMA_IDX register: write 0 at init,
+		 *     read back 0 immediately (MATCH) -- register is live.
+		 *     But after boot, RX_DMA_IDX reads back a *nonzero*
+		 *     value uniformly identical across every initialized
+		 *     ring of wildly different sizes within a qdma instance
+		 *     (16 to 1024 descriptors), which does not correspond to
+		 *     any actual descriptor-memory write found anywhere.
+		 *   - RX_CPU_IDX "doorbell": manually re-asserting the exact
+		 *     same already-programmed RX_CPU_IDX value (testing
+		 *     whether the QDMA hardware needs the write *event*, not
+		 *     a changed value, as a "check for room" trigger) made
+		 *     no difference either.
+		 *
+		 * The one remaining, untested hypothesis: EN7523's QDMA
+		 * write-back engine may only be able to complete DMA writes
+		 * into a specific pre-approved physical address window
+		 * (established by an SoC-level address firewall/remap this
+		 * driver, written for EN7581, doesn't know to configure),
+		 * silently dropping writes outside it while its own internal
+		 * producer-index register still advances as if nothing were
+		 * wrong -- which would exactly match "RX_DMA_IDX moves,
+		 * descriptor memory never changes". This reserved-memory
+		 * region (eth_ring_buf, see its own comment) gives the
+		 * driver's coherent DMA allocations (via
+		 * of_reserved_mem_device_init_by_idx() in airoha_probe(), a
+		 * real driver-side code change, not DTS-only) a fixed,
+		 * known-safe physical window to test that theory against.
+		 *
+		 * Not a confirmed fix. If this doesn't change the symptom
+		 * either, the register/DMA-level diagnostic surface is
+		 * exhausted and the remaining path is upstream collaboration
+		 * (this exact mystery is independently open in
+		 * openwrt/openwrt#20104 as of the most recent commit found).
+		 */
+		memory-region = <&eth_ring_buf>, <&qdma0_buf>, <&qdma1_buf>;
+		memory-region-names = "eth-ring-buf", "qdma0-buf", "qdma1-buf";
+
+		status = "disabled";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/*
+		 * Internal-PHY LAN port(s). GDM1's "internal" phy-mode is not
+		 * a discrete PHY chip -- it's the MAC's fixed internal link
+		 * into the chip's embedded switch fabric (not modeled in this
+		 * tree yet, see the switch@1fb58000 note in an7581.dtsi), so
+		 * there is no phy-handle/MDIO PHY to attach to. Confirmed on
+		 * real EN7523 hardware: without a fixed-link child node here,
+		 * airoha_dev_open() fails with "could not attach PHY: -19"
+		 * from phylink_of_phy_connect() -> phylink_fwnode_phy_connect()
+		 * (MLO_AN_PHY mode with no phy_node -> -ENODEV). an7581.dtsi's
+		 * own gdm1 node uses exactly this fixed-link (speed/duplex/
+		 * pause), matching GDM1's phylink_config.mac_capabilities of
+		 * MAC_ASYM_PAUSE | MAC_SYM_PAUSE | MAC_10000FD in
+		 * airoha_setup_phylink() -- copied verbatim here since it's
+		 * the same GDM1-to-switch-fabric link on this same IP block.
+		 */
+		eth_ephy: ethernet@1 {
+			compatible = "airoha,eth-mac";
+			reg = <1>;
+			phy-mode = "internal";
+			status = "disabled";
+
+			fixed-link {
+				speed = <10000>;
+				full-duplex;
+				pause;
+			};
+		};
+
+		/*
+		 * External HSGMII-facing LAN uplink. No pcs-handle: EN7523
+		 * has no upstream PCS driver (PCS_AIROHA_AN7581/AN7583 exist
+		 * in Kconfig, PCS_AIROHA_EN7523 does not), so the PCS block
+		 * the vendor DT calls pon_hsgmii@1fa65000 isn't modeled here.
+		 */
+		hsgmii_lan: ethernet@2 {
+			compatible = "airoha,eth-mac";
+			reg = <2>;
+			status = "disabled";
+		};
+
+		/* Virtual WAN-facing GDM/QDMA port (PON uplink) */
+		qdma_wan: ethernet@3 {
+			compatible = "airoha,eth-mac";
+			reg = <3>;
+			status = "disabled";
+		};
+	};
+
+	/*
+	 * Embedded GSW (Gigabit SWitch), same silicon block as the third
+	 * reg range of the vendor's combined frame_engine@1fb50000 node
+	 * (0x1fb58000/0x8000, see the note on the eth node above). EN7523
+	 * has its own dedicated reset line for it (EN7523_GSW_RST, in
+	 * dt-bindings/reset/airoha,en7523-reset.h) confirming this is real
+	 * EN7523 hardware, not an AN7581-only feature.
+	 *
+	 * eth_ephy (GDM1) above is this switch's CPU port (port@6 below,
+	 * matching an7581.dtsi's equivalent switch node) -- confirmed on
+	 * real hardware: with only eth_ephy enabled/fixed-link'd, the
+	 * resulting netdev came up but never reflected physical cable
+	 * insertion/removal, because a fixed-link by definition does no
+	 * real link sensing. The actual RJ45 LAN jacks are this switch's
+	 * port@1..4, each wired to one of the gsw_phy1..4 internal PHYs on
+	 * the switch's own local MDIO bus below -- link state for those
+	 * is real and probed via phylib.
+	 *
+	 * Deliberately no interrupt-controller/interrupts/interrupt-parent
+	 * here, unlike an7581.dtsi's switch node (GIC_SPI 31): real.dts
+	 * (the live vendor DT dump from a running EN7523 board) has no
+	 * switch/gsw node at all and GIC_SPI 31 does not appear anywhere
+	 * in it, so the vendor driver evidently does not use a switch IRQ
+	 * on this SoC/board -- and drivers/net/dsa/mt7530.c's
+	 * mt7530_setup_irq() explicitly supports this: it gates all IRQ
+	 * setup on of_property_read_bool(np, "interrupt-controller"), and
+	 * if that property is absent it logs "no interrupt support" and
+	 * returns 0 (not an error). Without it, gsw_phy1..4 below simply
+	 * fall back to phylib's standard software polling for link state,
+	 * like any MDIO PHY without a hardware IRQ line -- no functional
+	 * loss besides slower (~1s poll interval) link-change detection.
+	 *
+	 * Per-PHY "leds" subnodes (present in an7581.dtsi's gsw_phy1..4)
+	 * are deliberately omitted here -- not yet cross-checked against
+	 * this board's actual LED wiring (the ether_gpio/internet_gpio/
+	 * dsl_gpio env vars found in the vendor zld.bin binary are board-
+	 * level status LEDs, unrelated to these per-PHY LED registers).
+	 */
+	switch: switch@1fb58000 {
+		compatible = "airoha,en7581-switch";
+		reg = <0x1fb58000 0x8000>;
+		resets = <&scu EN7523_GSW_RST>;
+
+		/*
+		 * Confirmed on real hardware (readback-verify DIAG patch):
+		 * MT753X_CPORT_SPTAG_CFG (offset 0x7c10, an EN7581/AN7583-only
+		 * special-tag enable register mt7530.c's mt7531_setup_common()
+		 * writes unconditionally for priv->id == ID_EN7581) reads back
+		 * 0xdeadbeef here -- unbacked address space on EN7523 silicon,
+		 * unlike every other CPU-forwarding register in this same
+		 * switch block (PVC_P/MFC/MT7531_CFC/PCR_P), which all read
+		 * back exactly what was written. See
+		 * 998-fix-mt7530-en7523-skip-cport-sptag.patch.
+		 */
+		airoha,no-cport-sptag-cfg;
+
+		status = "disabled";
+
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* Port 0 / PHY 8: the fifth GbE PHY of the internal
+			 * switch. On the EX3501-T0 this is the candidate for
+			 * the WAN jack (ports 1-4 are the LAN jacks).
+			 */
+			gsw_port0: port@0 {
+				reg = <0>;
+				phy-mode = "internal";
+				phy-handle = <&gsw_phy0>;
+				status = "disabled";
+			};
+
+			gsw_port1: port@1 {
+				reg = <1>;
+				phy-mode = "internal";
+				phy-handle = <&gsw_phy1>;
+				status = "disabled";
+			};
+
+			gsw_port2: port@2 {
+				reg = <2>;
+				phy-mode = "internal";
+				phy-handle = <&gsw_phy2>;
+				status = "disabled";
+			};
+
+			gsw_port3: port@3 {
+				reg = <3>;
+				phy-mode = "internal";
+				phy-handle = <&gsw_phy3>;
+				status = "disabled";
+			};
+
+			gsw_port4: port@4 {
+				reg = <4>;
+				phy-mode = "internal";
+				phy-handle = <&gsw_phy4>;
+				status = "disabled";
+			};
+
+			port@6 {
+				reg = <6>;
+				ethernet = <&eth_ephy>;
+				phy-mode = "internal";
+
+				fixed-link {
+					speed = <10000>;
+					full-duplex;
+					pause;
+				};
+			};
+		};
+
+		gsw_mdio: mdio {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			gsw_phy0: ethernet-phy@8 {
+				compatible = "ethernet-phy-ieee802.3-c22";
+				reg = <8>;
+				phy-mode = "internal";
+				status = "disabled";
+			};
+
+			gsw_phy1: ethernet-phy@9 {
+				compatible = "ethernet-phy-ieee802.3-c22";
+				reg = <9>;
+				phy-mode = "internal";
+				status = "disabled";
+			};
+
+			gsw_phy2: ethernet-phy@a {
+				compatible = "ethernet-phy-ieee802.3-c22";
+				reg = <10>;
+				phy-mode = "internal";
+				status = "disabled";
+			};
+
+			gsw_phy3: ethernet-phy@b {
+				compatible = "ethernet-phy-ieee802.3-c22";
+				reg = <11>;
+				phy-mode = "internal";
+				status = "disabled";
+			};
+
+			gsw_phy4: ethernet-phy@c {
+				compatible = "ethernet-phy-ieee802.3-c22";
+				reg = <12>;
+				phy-mode = "internal";
+				status = "disabled";
+			};
+		};
+	};
+};

@@ -1,0 +1,14 @@
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+zyxel,ex3501-t0)
+	ucidef_set_led_netdev "wan" "WAN" "green:wan" "wan" "link tx rx"
+	ucidef_set_led_usbport "usb" "USB" "green:usb" "usb1-port2"
+	;;
+esac
+
+board_config_flush
+
+exit 0

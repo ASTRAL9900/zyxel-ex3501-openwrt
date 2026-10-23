@@ -1,0 +1,53 @@
+#!/bin/sh /etc/rc.common
+# EX3501: mark a boot healthy (LAN bridge up, SSH listening, WiFi up unless
+# disabled in the config) so the preinit rescue check does not count it,
+# and keep a recent known-good snapshot for `kurtar`. Three unhealthy boots
+# in a row land in rescue mode (lib/preinit/31_en7523_rescue_check).
+
+START=99
+
+wifi_wanted() {
+	local s dev
+
+	for s in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		[ "$(uci -q get wireless.$s.disabled)" = 1 ] && continue
+		dev=$(uci -q get wireless.$s.device)
+		[ "$(uci -q get wireless.$dev.disabled)" = 1 ] && continue
+		return 0
+	done
+	return 1
+}
+
+healthy() {
+	[ "$(cat /sys/class/net/br-lan/operstate 2>/dev/null)" = up ] || return 1
+	netstat -ltn 2>/dev/null | grep -q ':22 ' || return 1
+	wifi_wanted || return 0
+	ls -d /sys/class/net/phy*-ap* >/dev/null 2>&1
+}
+
+check() {
+	. /lib/en7523-rescue.sh
+	local st=/overlay/$RESCUE_DIR i
+
+	[ -d /overlay/upper ] || return 0
+	mkdir -p "$st"
+	for i in $(seq 1 30); do
+		healthy && break
+		sleep 10
+	done
+	healthy || { logger -t en7523-health "boot NOT healthy (bootcount kept)"; return 0; }
+	echo 0 > "$st/bootcount"
+	logger -t en7523-health "boot healthy"
+	# Snapshot when there is none yet or the config changed since the last
+	# one; at most once a day so a slowly breaking change cannot rotate all
+	# good snapshots away within a day.
+	if [ ! -e "$st/last-snapshot" ] ||
+	   { [ -n "$(find /overlay/upper/etc -newer "$st/last-snapshot" 2>/dev/null | head -n1)" ] &&
+	     [ -n "$(find "$st/last-snapshot" -mmin +1440 2>/dev/null)" ]; }; then
+		/usr/sbin/kurtar kaydet otomatik | logger -t en7523-health
+	fi
+}
+
+start() {
+	( sleep 60; check ) >/dev/null 2>&1 &
+}

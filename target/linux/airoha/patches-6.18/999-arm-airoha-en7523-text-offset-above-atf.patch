@@ -1,0 +1,29 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: ARM: airoha: link the kernel 0x88000 into DRAM to keep clear of ATF
+
+On EN7523 boards the vendor boot chain (BL2 -> BL32/sp_min -> U-Boot) leaves
+the AArch32 Trusted Firmware runtime resident at the very start of DRAM
+(vendor DT: atf-reserved-memory@80000000, 0x40000 bytes, no-map). With the
+default TEXT_OFFSET of 0x8000 the raw kernel Image lands at 0x80008000 and
+overwrites it, so the first PSCI SMC ("psci: probing for conduit method
+from DT") jumps into kernel text and the boot locks up hard -- which is
+exactly what was observed on the Zyxel EX3501-T0 and mis-diagnosed as
+"this U-Boot has no PSCI conduit". The vendor kernel is linked at
+PAGE_OFFSET + 0x88000 (virt 0xC0088000, phys 0x80088000) for this reason.
+
+Use the same text offset for ARCH_AIROHA so head.S still derives
+PHYS_OFFSET = 0x80000000 from the 0x80088000 load address, and the EL3
+runtime survives. Pair with KERNEL_LOADADDR := 0x80088000 in the image
+recipe and re-enable the psci node / cpu enable-method in the board DT.
+
+--- a/arch/arm/Makefile
++++ b/arch/arm/Makefile
+@@ -160,6 +160,8 @@
+ # during boot, and this offset is critical to the functioning of
+ # kexec-tools.
+ textofs-y	:= 0x00008000
++# Airoha EN7523: keep the kernel above the resident AArch32 TF-A (sp_min)
++textofs-$(CONFIG_ARCH_AIROHA) := 0x00088000
+ # RTD1195 has Boot ROM at start of address space
+ textofs-$(CONFIG_ARCH_REALTEK)  := 0x00108000
+ # SA1111 DMA bug: we don't want the kernel to live in precious DMA-able memory

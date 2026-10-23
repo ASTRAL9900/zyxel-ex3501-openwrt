@@ -1,0 +1,97 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: net: dsa: mt7530: EN7523 embedded switch support
+
+The Airoha EN7523 embeds an MT7530-class switch driven as
+"airoha,en7581-switch" but without the CPORT_SPTAG_CFG register (0x7c10
+reads back 0xdeadbeef).  Boards set "airoha,no-cport-sptag-cfg":
+
+- skip the CPORT_SPTAG_CFG write;
+- program the CPU port special tag in 802.1Q format (STAG_VPID 0x8100 +
+  PVC bit 15 + PORT_SPEC_TAG, as the stock firmware does: PVC_P(6) =
+  0x81008120).  Only in that format does the EN7523 frame engine strip
+  the tag on ingress and report the source port in the RX descriptor,
+  and insert it on egress from the TX descriptor, which is what lets
+  the PPE parse L3 and hardware NAT work.
+--- a/drivers/net/dsa/mt7530.h
++++ b/drivers/net/dsa/mt7530.h
+@@ -338,6 +338,12 @@
+ };
+ 
+ #define  STAG_VPID			(((x) & 0xffff) << 16)
++/* EN7523 (Airoha FE): special tag in 802.1Q format -- the frame engine
++ * strips it on ingress (source port reported in the RX descriptor) and
++ * inserts it from the TX descriptor; stock firmware PVC_P(cpu) = 0x81008120.
++ */
++#define  EN7523_STAG_VPID_MASK		GENMASK(31, 16)
++#define  EN7523_PVC_STAG_8021Q_FMT	BIT(15)
+ 
+ /* Register for port port-and-protocol based vlan 1 control */
+ #define MT7530_PPBV1_P(x)		(0x2014 + ((x) * 0x100))
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@ -4,6 +4,7 @@
+  * Copyright (C) 2017 Sean Wang <sean.wang@mediatek.com>
+  */
+ #include <linux/etherdevice.h>
++#include <linux/bitfield.h>
+ #include <linux/if_bridge.h>
+ #include <linux/iopoll.h>
+ #include <linux/mdio.h>
+@@ -1287,6 +1288,25 @@
+ 			   TO_CPU_FW_CPU_ONLY);
+ }
+ 
++/* EN7523: the Airoha frame engine recognises the switch special tag only
++ * in its 802.1Q format (TPID from STAG_VPID plus PVC bit 15, as the stock
++ * firmware programs it).  In that mode GDM1 strips the tag before the PPE
++ * (hardware NAT can parse L3) and reports the source port in the RX
++ * descriptor; the raw MTK 4-byte format is passed through untouched and
++ * makes the PPE see ethertype 0x000p.
++ */
++static void mt753x_en7523_cpu_sptag(struct mt7530_priv *priv, int port)
++{
++	if (!of_property_read_bool(priv->dev->of_node,
++				   "airoha,no-cport-sptag-cfg"))
++		return;
++
++	mt7530_rmw(priv, MT7530_PVC_P(port),
++		   EN7523_STAG_VPID_MASK | EN7523_PVC_STAG_8021Q_FMT,
++		   FIELD_PREP(EN7523_STAG_VPID_MASK, ETH_P_8021Q) |
++		   EN7523_PVC_STAG_8021Q_FMT);
++}
++
+ static void
+ mt753x_cpu_port_enable(struct dsa_switch *ds, int port)
+ {
+@@ -1296,6 +1316,7 @@
+ 	mt7530_write(priv, MT7530_PVC_P(port),
+ 		     PORT_SPEC_TAG);
+ 
++	mt753x_en7523_cpu_sptag(priv, port);
+ 	/* Enable flooding on the CPU port */
+ 	mt7530_set(priv, MT753X_MFC, BC_FFP(BIT(port)) | UNM_FFP(BIT(port)) |
+ 		   UNU_FFP(BIT(port)));
+@@ -1616,6 +1637,7 @@
+ 			     PCR_MATRIX(dsa_user_ports(priv->ds)));
+ 		mt7530_write(priv, MT7530_PVC_P(cpu_dp->index), PORT_SPEC_TAG
+ 			     | PVC_EG_TAG(MT7530_VLAN_EG_CONSISTENT));
++		mt753x_en7523_cpu_sptag(priv, cpu_dp->index);
+ 	}
+ }
+ 
+@@ -2624,8 +2646,13 @@
+ 	/* Allow mirroring frames received on the local port (monitor port). */
+ 	mt7530_set(priv, MT753X_AGC, LOCAL_EN);
+ 
+-	/* Enable Special Tag for rx frames */
+-	if (priv->id == ID_EN7581 || priv->id == ID_AN7583)
++	/* Enable Special Tag for rx frames.  EN7523 has no CPORT_SPTAG_CFG
++	 * register (reads back 0xdeadbeef): its frame engine expects the
++	 * 802.1Q-format special tag set up in mt753x_en7523_cpu_sptag().
++	 */
++	if ((priv->id == ID_EN7581 || priv->id == ID_AN7583) &&
++	    !of_property_read_bool(priv->dev->of_node,
++				   "airoha,no-cport-sptag-cfg"))
+ 		mt7530_write(priv, MT753X_CPORT_SPTAG_CFG,
+ 			     CPORT_SW2FE_STAG_EN | CPORT_FE2SW_STAG_EN);
+ 

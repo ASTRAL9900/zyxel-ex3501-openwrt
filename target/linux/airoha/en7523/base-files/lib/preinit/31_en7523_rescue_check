@@ -1,0 +1,36 @@
+# EX3501: enter failsafe (= rescue mode) when `kurtar mod` asked for it or
+# when the last RESCUE_BOOT_LIMIT boots never became healthy (see
+# /etc/init.d/en7523-health). Runs after failsafe_wait, so the normal
+# "press a button during boot" failsafe keeps working too. Never blocks: any
+# error just means a normal boot.
+
+en7523_rescue_check() {
+	[ "$pi_preinit_no_failsafe" = "y" ] && return
+	. /lib/en7523-rescue.sh
+
+	local od cnt req=
+	od=$(rescue_od rw) || return 0
+	mkdir -p "$od/$RESCUE_DIR"
+	[ -e "$od/$RESCUE_DIR/request" ] && req=1
+	rm -f "$od/$RESCUE_DIR/request"
+	cnt=$(cat "$od/$RESCUE_DIR/bootcount" 2>/dev/null)
+	case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+	cnt=$((cnt + 1))
+	echo "$cnt" > "$od/$RESCUE_DIR/bootcount"
+	rescue_od_release
+
+	[ "$FAILSAFE" = "true" ] && { echo button > /tmp/en7523_rescue_reason; return; }
+	if [ -n "$req" ]; then
+		echo request > /tmp/en7523_rescue_reason
+	elif [ "$cnt" -gt "$RESCUE_BOOT_LIMIT" ]; then
+		echo "bootcount $cnt" > /tmp/en7523_rescue_reason
+	else
+		return 0
+	fi
+	echo "- EX3501 rescue mode: $(cat /tmp/en7523_rescue_reason) -" > /dev/console
+	FAILSAFE=true
+	export FAILSAFE
+	touch /tmp/failsafe
+}
+
+boot_hook_add preinit_main en7523_rescue_check

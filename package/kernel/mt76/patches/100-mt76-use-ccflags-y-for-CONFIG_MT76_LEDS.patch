@@ -1,0 +1,40 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: [PATCH] mt76: use ccflags-y for CONFIG_MT76_LEDS in sub-drivers
+
+The mt7603/mt7615/mt7915 sub-directory Makefiles pass -DCONFIG_MT76_LEDS
+through EXTRA_CFLAGS. Kbuild in recent kernels (6.18) no longer honours
+EXTRA_CFLAGS, so IS_ENABLED(CONFIG_MT76_LEDS) evaluates to false in those
+drivers: the LED callbacks are never installed and mt76_led_init() returns
+before registering the "mt76-phyN" LEDs (seen on an MT7916: no LED class
+device, no "registering led" message). Use ccflags-y like the top-level
+Makefile does.
+
+--- a/mt7915/Makefile
++++ b/mt7915/Makefile
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: BSD-3-Clause-Clear
+
+-EXTRA_CFLAGS += -DCONFIG_MT76_LEDS
++ccflags-y += -DCONFIG_MT76_LEDS
+ obj-$(CONFIG_MT7915E) += mt7915e.o
+
+ mt7915e-y := pci.o init.o dma.o eeprom.o main.o mcu.o mac.o \
+--- a/mt7615/Makefile
++++ b/mt7615/Makefile
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: BSD-3-Clause-Clear
+
+-EXTRA_CFLAGS += -DCONFIG_MT76_LEDS
++ccflags-y += -DCONFIG_MT76_LEDS
+ obj-$(CONFIG_MT7615_COMMON) += mt7615-common.o
+ obj-$(CONFIG_MT7615E) += mt7615e.o
+ obj-$(CONFIG_MT7663_USB_SDIO_COMMON) += mt7663-usb-sdio-common.o
+--- a/mt7603/Makefile
++++ b/mt7603/Makefile
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: BSD-3-Clause-Clear
+-EXTRA_CFLAGS += -Werror -DCONFIG_MT76_LEDS
++ccflags-y += -Werror -DCONFIG_MT76_LEDS
+ obj-m += mt7603e.o
+
+ mt7603e-y := \

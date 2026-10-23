@@ -1,0 +1,57 @@
+#
+# Copyright (c) 2015 The Linux Foundation. All rights reserved.
+# Copyright (c) 2011-2015 OpenWrt.org
+#
+
+. /lib/functions/uci-defaults.sh
+. /lib/functions/system.sh
+
+en7523_setup_interfaces()
+{
+	local board="$1"
+
+	case "$board" in
+	zyxel,ex3501-t0)
+		# eth0 is airoha_eth's GDM1 -- the DSA master/conduit device
+		# (fixed-link into the embedded switch's CPU port, see the
+		# switch@1fb58000 comment in en7523-base.dtsi), not a
+		# physical jack. Confirmed on real hardware: adding it to
+		# br-lan alongside the DSA user ports breaks traffic (ARP
+		# never resolves) -- only the switch's own user ports
+		# (eth1-eth4, one per gsw_portN, RJ45 jacks) belong in the
+		# bridge. No gsw_portN has a "label" property yet (LED/
+		# board-position wiring not confirmed for this unit), so
+		# they keep the DSA-default sequential eth1..eth4 naming
+		# instead of lanN. qdma_wan (ethernet@3) is still
+		# status="disabled" (needs a PCS EN7523 doesn't have a
+		# driver for yet), so there is no WAN port to split off --
+		# all four are treated as LAN for now.
+		# 2026-09-26: gsw_port0 (switch PHY 8) is now enabled with
+		# label "wan" as the WAN-jack candidate; the four PHY ports
+		# stay LAN. The unit's real MAC lives in the U-Boot env
+		# (ethaddr=xx:xx:xx:xx:xx:x0) -- read it here in userspace:
+		# putting nvmem-cells on the GDM1 node makes airoha_eth
+		# defer its probe and hang the boot (see the board dts).
+		# Jack "WAN/LAN" = switch port 1 (dts label "wan"); the
+		# other three jacks are lan1..lan3 (ports 2-4). Confirmed on
+		# hardware 2026-09-26 (cable in WAN/LAN -> eth1 carrier).
+		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
+		local mac="$(mtd_get_mac_ascii u-boot-env ethaddr)"
+		[ -n "$mac" ] && {
+			ucidef_set_network_device_mac eth0 "$mac"
+			ucidef_set_interface_macaddr "lan" "$mac"
+			ucidef_set_interface_macaddr "wan" "$(macaddr_add "$mac" 1)"
+		}
+		;;
+	*)
+		echo "Unsupported hardware. Network interfaces not initialized"
+		;;
+	esac
+}
+
+board_config_update
+board=$(board_name)
+en7523_setup_interfaces $board
+board_config_flush
+
+exit 0

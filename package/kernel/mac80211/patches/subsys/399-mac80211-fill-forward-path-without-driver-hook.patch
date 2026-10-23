@@ -1,0 +1,46 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: [PATCH] wifi: mac80211: resolve forward path for AP stations without a driver hook
+
+Without a driver .net_fill_forward_path (no WED, e.g. MT7916 on Airoha
+EN7523) the flowtable forward-path lookup through a bridge failed with
+-EOPNOTSUPP, so flows towards WiFi stations were described with the
+bridge as output device (neighbour xmit) and could not be offloaded by the
+ethernet PPE fast path. For AP/AP_VLAN interfaces with an authorized
+station, end the path at the wireless netdev as a plain Ethernet device.
+
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -952,7 +952,9 @@
+ 	sdata = IEEE80211_DEV_TO_SUB_IF(ctx->dev);
+ 	local = sdata->local;
+ 
+-	if (!local->ops->net_fill_forward_path)
++	if (!local->ops->net_fill_forward_path &&
++	    sdata->vif.type != NL80211_IFTYPE_AP &&
++	    sdata->vif.type != NL80211_IFTYPE_AP_VLAN)
+ 		return -EOPNOTSUPP;
+ 
+ 	rcu_read_lock();
+@@ -992,6 +994,22 @@
+ 	if (!sta)
+ 		goto out;
+ 
++	if (!local->ops->net_fill_forward_path) {
++		/* No hardware (WED) path: terminate the forward path at this
++		 * interface as a plain Ethernet device, so that flowtables
++		 * can transmit (and offload) flows straight to it instead of
++		 * falling back to the bridge/neighbour path.
++		 */
++		if (!test_sta_flag(sta, WLAN_STA_AUTHORIZED))
++			goto out;
++
++		path->type = DEV_PATH_ETHERNET;
++		path->dev = ctx->dev;
++		ctx->dev = NULL;
++		ret = 0;
++		goto out;
++	}
++
+ 	ret = drv_net_fill_forward_path(local, sdata, &sta->sta, ctx, path);
+ out:
+ 	rcu_read_unlock();

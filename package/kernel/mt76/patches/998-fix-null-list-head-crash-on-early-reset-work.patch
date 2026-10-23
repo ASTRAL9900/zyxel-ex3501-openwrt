@@ -1,0 +1,109 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: [PATCH] mt76: mt7915: fix NULL list_head crash when reset_work fires before probe completes
+
+On real hardware where mt7915_mcu_init() (the firmware/MCU load
+handshake) times out ("Failed to get patch semaphore"), probe fails
+and returns before mt76_register_device() is ever reached -- so
+mt76_phy_init() never runs and phy->tx_list is left as raw zeroed
+memory (next/prev == NULL). reset_work, however, is INIT_WORK'd
+earlier in mt7915_register_device(), before the firmware init call,
+and a hardware watchdog interrupt reacting to firmware never coming
+up can schedule it anyway.
+
+list_empty()'s "next == self" invariant does not hold for
+zero-initialized memory, so mt76_txq_schedule_pending()'s early-exit
+guard is silently bypassed, and list_splice_init() dereferences the
+NULL list_head. Confirmed on real ARM32 hardware: NULL pointer write
+at fault address 0x4 (offset of struct list_head's "prev" on this
+32-bit target), call trace mt7915_mac_reset_work ->
+mt7915_mac_full_reset -> mt7915_mac_restart ->
+mt76_txq_schedule_all(&dev->mphy) -> mt76_txq_schedule_pending,
+PC at mt76_txq_schedule_pending+0x5c.
+
+Two complementary fixes:
+
+ 1. Initialize phy->tx_list/tx_lock in mt76_alloc_device(), at the
+    very start of the device's lifetime, instead of only in
+    mt76_phy_init() (reached much later, after firmware init has
+    already succeeded). This closes the invariant-violation window
+    regardless of which early-triggered path touches phy->tx_list
+    first. mt76_phy_init()'s own (now redundant) init is left in
+    place -- re-initializing an empty, not-yet-used list is
+    harmless.
+
+ 2. Bail out of mt7915_mac_reset_work() immediately if the device
+    was never fully registered (MT76_STATE_REGISTERED unset) --
+    every code path in that function assumes a fully-up device
+    (mac80211 hw, tx_worker, napi, wcid/tx_list state, ...), and a
+    reset cannot usefully do anything for a device that never
+    finished probing in the first place.
+
+Does not fix the underlying firmware semaphore timeout itself (WiFi
+still won't come up) -- this only prevents the resulting watchdog
+recovery attempt from crashing the kernel and causing a reboot loop.
+
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -690,6 +690,34 @@ mt76_alloc_device(struct device *pdev,
+ 	phy->band_idx = MT_BAND0;
+ 	dev->phys[phy->band_idx] = phy;
+
++	/*
++	 * phy->tx_list/tx_lock are otherwise first initialized in
++	 * mt76_phy_init(), which only runs once mt76_register_device()
++	 * is reached -- i.e. after the driver's own firmware/MCU init
++	 * (e.g. mt7915_mcu_init()) has already succeeded. If that
++	 * firmware handshake times out, probe fails and returns before
++	 * mt76_register_device() ever runs, leaving phy->tx_list as raw
++	 * zeroed memory (next/prev == NULL). That doesn't satisfy
++	 * list_empty()'s "next == self" invariant, so a still-armed
++	 * hardware-watchdog-triggered reset_work (INIT_WORK'd earlier in
++	 * probe, before the same firmware init call) can walk straight
++	 * past mt76_txq_schedule_pending()'s list_empty() guard into
++	 * list_splice_init(), dereferencing a NULL list_head -- observed
++	 * on real hardware as a NULL pointer write in
++	 * mt76_txq_schedule_pending, reached via mt7915_mac_reset_work ->
++	 * mt7915_mac_full_reset -> mt7915_mac_restart ->
++	 * mt76_txq_schedule_all(&dev->mphy), fault address 0x4 (offset
++	 * of struct list_head's "prev" on this 32-bit ARM target).
++	 * Initializing here, at the very start of the device's
++	 * lifetime -- before any firmware/probe work that could fail --
++	 * closes that window regardless of which early-triggered path
++	 * ends up touching phy->tx_list first. mt76_phy_init()'s own
++	 * (now redundant) init is left in place; re-initializing an
++	 * empty, not-yet-used list is harmless.
++	 */
++	INIT_LIST_HEAD(&phy->tx_list);
++	spin_lock_init(&phy->tx_lock);
++
+ 	spin_lock_init(&dev->rx_lock);
+ 	spin_lock_init(&dev->lock);
+ 	spin_lock_init(&dev->cc_lock);
+
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1478,6 +1478,25 @@ void mt7915_mac_reset_work(struct work_
+ 	int i;
+
+ 	dev = container_of(work, struct mt7915_dev, reset_work);
++
++	/*
++	 * reset_work is INIT_WORK'd (mt7915_register_device()) before the
++	 * driver's firmware/MCU init (mt7915_init_hardware() ->
++	 * mt7915_mcu_init()) runs, and a hardware watchdog interrupt can
++	 * schedule it in response to firmware never coming up -- i.e.
++	 * this can fire before mt76_register_device() (and therefore
++	 * MT76_STATE_REGISTERED) is ever reached, on a device that never
++	 * finished probing. Every path below assumes a fully registered
++	 * device (mac80211 hw, tx_worker, napi, wcid/tx_list state, ...);
++	 * running any of it against that half-initialized state is what
++	 * produced a NULL list_head dereference in
++	 * mt76_txq_schedule_pending() on real hardware. Bail out here
++	 * instead -- there is nothing a *reset* can usefully do for a
++	 * device that never successfully started in the first place.
++	 */
++	if (!test_bit(MT76_STATE_REGISTERED, &dev->mphy.state))
++		return;
++
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;

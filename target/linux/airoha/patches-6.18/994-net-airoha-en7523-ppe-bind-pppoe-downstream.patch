@@ -1,0 +1,42 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: [PATCH] net: airoha: en7523: bind PPPoE download flows
+
+The EN7523 PPE never writes unbind entries, so the driver builds the bind
+decision from the received frame (airoha_ppe_en7523_skb_tuple()). The
+parser skipped a single 802.1Q tag and then required IPv4, so on PPPoE WAN
+links (e.g. Turk Telekom: VLAN 35 + PPPoE) every download-direction frame
+was rejected and those flows were never bound: upload was offloaded, the
+download ran on the CPU (594 Mbit/s on a 1000 Mbit/s line, one core busy).
+
+Skip the PPPoE session header and PPP protocol field for PPP IPv4 payloads.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -11,6 +11,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/rhashtable.h>
++#include <linux/ppp_defs.h>
+ #include <net/ipv6.h>
+ #include <linux/if_vlan.h>
+ #include <net/pkt_cls.h>
+@@ -1061,6 +1062,19 @@
+ 		p += 4;
+ 		room -= 4;
+ 	}
++	/* WAN download direction on PPPoE links (e.g. VLAN 35 + PPPoE):
++	 * skip the 6-byte PPPoE session header and the 2-byte PPP protocol
++	 * field; only PPP IPv4 (0x0021) payloads are offloaded.
++	 */
++	if (proto == htons(ETH_P_PPP_SES)) {
++		if (room < 8 || p[0] != 0x11 || p[1] != 0x00)
++			return false;
++		if (get_unaligned((const __be16 *)(p + 6)) != htons(PPP_IP))
++			return false;
++		proto = htons(ETH_P_IP);
++		p += 8;
++		room -= 8;
++	}
+ 	if (proto != htons(ETH_P_IP) || room < (int)sizeof(*iph))
+ 		return false;
+ 

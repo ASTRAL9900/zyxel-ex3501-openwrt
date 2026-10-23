@@ -1,0 +1,112 @@
+# EX3501 rescue mode network, added to the failsafe hook chain. Failsafe
+# itself only puts 192.168.1.1 on lan1 and starts dropbear; here:
+#  - bridge lan1-lan3 as br-lan (192.168.1.1) with DHCP,
+#  - a 2.4 GHz rescue AP "EX3501-KURTARMA" in the same bridge,
+#  - SSH logins with the root password / keys of the installed system.
+# Credentials and the WiFi key are read from the system's own flash (upper/
+# or the newest snapshot) at runtime; nothing secret is stored in the image.
+# Every step is best effort: a failure leaves at least lan1 + SSH.
+
+en7523_rescue_log() {
+	echo "rescue: $*" > /dev/console
+	echo "rescue: $*" >> /tmp/en7523_rescue.log
+}
+
+en7523_rescue_creds() {
+	local od=$1 f
+
+	mkdir -p /tmp/rescue-etc
+	if rescue_cat_cfg "$od" etc/shadow > /tmp/rescue-etc/shadow 2>/dev/null &&
+	   grep -q '^root:[^:!*]' /tmp/rescue-etc/shadow; then
+		chmod 600 /tmp/rescue-etc/shadow
+		mount --bind /tmp/rescue-etc/shadow /etc/shadow &&
+			en7523_rescue_log "root password of the installed system enabled"
+	else
+		en7523_rescue_log "no root password found, SSH needs a key"
+	fi
+	f=etc/dropbear/authorized_keys
+	if rescue_cat_cfg "$od" $f > /tmp/rescue-etc/authorized_keys 2>/dev/null &&
+	   [ -s /tmp/rescue-etc/authorized_keys ]; then
+		chmod 600 /tmp/rescue-etc/authorized_keys
+		mount --bind /tmp/rescue-etc/authorized_keys /etc/dropbear/authorized_keys &&
+			en7523_rescue_log "SSH keys of the installed system enabled"
+	fi
+}
+
+en7523_rescue_wifi_key() {
+	local od=$1 key=
+
+	mkdir -p /tmp/rescue-uci
+	rescue_cat_cfg "$od" etc/config/wireless > /tmp/rescue-uci/wireless 2>/dev/null &&
+		key=$(uci -q -c /tmp/rescue-uci get wireless.@wifi-iface[0].key)
+	[ ${#key} -ge 8 ] && echo "$key"
+}
+
+en7523_rescue_net() {
+	. /lib/en7523-rescue.sh
+	local od p phy= key i
+
+	echo "$(cat /tmp/en7523_rescue_reason 2>/dev/null || echo button)" \
+		> /tmp/en7523_rescue_mode
+	od=$(rescue_od ro) || od=
+
+	[ -n "$od" ] && en7523_rescue_creds "$od"
+
+	# LAN: all three ports in one bridge, DHCP for laptops and phones.
+	if ip link add br-lan type bridge 2>/dev/null; then
+		ip -4 addr flush dev lan1 2>/dev/null
+		for p in lan1 lan2 lan3; do
+			ip link set "$p" master br-lan 2>/dev/null
+			ip link set "$p" up 2>/dev/null
+		done
+		ip link set br-lan up
+		ip addr add 192.168.1.1/24 dev br-lan
+	fi
+	ip link show br-lan >/dev/null 2>&1 && dnsmasq --user=root --port=0 \
+		--interface=br-lan --bind-interfaces \
+		--dhcp-range=192.168.1.100,192.168.1.150,1h \
+		--dhcp-leasefile=/tmp/rescue-dhcp.leases \
+		--pid-file=/tmp/rescue-dnsmasq.pid 2>/dev/null &&
+		en7523_rescue_log "LAN br-lan 192.168.1.1, DHCP .100-.150"
+
+	# WiFi: load the drivers (failsafe only loads modules-boot.d).
+	key=$(en7523_rescue_wifi_key "$od")
+	[ -n "$od" ] && rescue_od_release
+	[ -n "$key" ] || { en7523_rescue_log "no WiFi key found, WiFi off"; return 0; }
+	/sbin/kmodloader >/dev/null 2>&1
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		for p in /sys/class/ieee80211/*; do
+			[ -e "$p" ] || continue
+			iw phy "${p##*/}" info 2>/dev/null | grep -q "2412.0 MHz" &&
+				phy=${p##*/} && break 2
+		done
+		sleep 1
+	done
+	[ -n "$phy" ] || { en7523_rescue_log "no 2.4 GHz radio, WiFi off"; return 0; }
+	iw phy "$phy" interface add kurtar0 type __ap 2>/dev/null
+	cat > /tmp/rescue-hostapd.conf <<EOF
+interface=kurtar0
+bridge=br-lan
+driver=nl80211
+ssid=EX3501-KURTARMA
+country_code=TR
+hw_mode=g
+channel=6
+ieee80211n=1
+wmm_enabled=1
+auth_algs=1
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=$key
+EOF
+	chmod 600 /tmp/rescue-hostapd.conf
+	if /usr/sbin/hostapd -B -P /tmp/rescue-hostapd.pid /tmp/rescue-hostapd.conf \
+		> /tmp/rescue-hostapd.out 2>&1; then
+		en7523_rescue_log "WiFi EX3501-KURTARMA on $phy ch6 (WPA2, normal WiFi key)"
+	else
+		en7523_rescue_log "hostapd failed, see /tmp/rescue-hostapd.out"
+	fi
+}
+
+boot_hook_add failsafe en7523_rescue_net

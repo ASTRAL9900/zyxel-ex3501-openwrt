@@ -1,0 +1,67 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: [PATCH] net: airoha: sync only the used part of RX buffers
+
+On the non-coherent EN7523 (Cortex-A53, AArch32) a perf profile of WiFi
+download traffic (LAN -> MT7916) showed v7_dma_inv_range as the single
+hottest symbol (~10% of CPU time). Two sources:
+
+- airoha_qdma_rx_process() synced the whole RX buffer for the CPU before
+  even reading the received length;
+- the page pool was created with PP_FLAG_DMA_SYNC_DEV and max_len =
+  PAGE_SIZE while every page holds two RX buffers, so each recycled
+  fragment invalidated the full 4 KiB page.
+
+Sync only the received length for the CPU and drop PP_FLAG_DMA_SYNC_DEV in
+favour of syncing exactly the buffer handed to the hardware at refill.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -734,6 +734,12 @@
+ 		e->buf = page_address(page) + offset;
+ 		e->dma_addr = page_pool_get_dma_addr(page) + offset;
+ 		e->dma_len = SKB_WITH_OVERHEAD(AIROHA_RX_LEN(q->buf_size));
++		/* Hand only the region the DMA engine may write back to the
++		 * device (the pool no longer syncs whole pages, see
++		 * airoha_qdma_init_rx_queue()).
++		 */
++		dma_sync_single_for_device(qdma->eth->dev, e->dma_addr,
++					   e->dma_len, DMA_FROM_DEVICE);
+ 
+ 		WRITE_ONCE(desc->tcp_ts_reply, 0);
+ 		val = FIELD_PREP(QDMA_DESC_LEN_MASK, e->dma_len);
+@@ -982,15 +988,19 @@
+ 		q->tail = (q->tail + 1) % q->ndesc;
+ 		q->queued--;
+ 
+-		dma_sync_single_for_cpu(eth->dev, e->dma_addr, e->dma_len,
+-					dir);
+-
+ 		page = virt_to_head_page(e->buf);
+ 		len = FIELD_GET(QDMA_DESC_LEN_MASK, desc_ctrl);
+ 		data_len = q->skb ? AIROHA_RX_LEN(q->buf_size) : e->dma_len;
+ 		if (!len || data_len < len)
+ 			goto free_frag;
+ 
++		/* Only the received bytes need to be made visible to the CPU:
++		 * cache maintenance on the whole buffer dominated the RX
++		 * profile on EN7523 (non-coherent Cortex-A53, v7_dma_inv_range).
++		 */
++		dma_sync_single_for_cpu(eth->dev, e->dma_addr,
++					min_t(u32, len, e->dma_len), dir);
++
+ 		dev = airoha_qdma_get_gdm_dev(eth, desc);
+ 		if (IS_ERR(dev))
+ 			goto free_frag;
+@@ -1123,7 +1133,11 @@
+ {
+ 	struct page_pool_params pp_params = {
+ 		.pool_size = 256,
+-		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
++		/* No PP_FLAG_DMA_SYNC_DEV: with two RX buffers per page the
++		 * pool would invalidate the full page on every recycle; the
++		 * refill path syncs just the buffer handed to the hardware.
++		 */
++		.flags = PP_FLAG_DMA_MAP,
+ 		.dma_dir = DMA_FROM_DEVICE,
+ 		.nid = NUMA_NO_NODE,
+ 		.dev = qdma->eth->dev,

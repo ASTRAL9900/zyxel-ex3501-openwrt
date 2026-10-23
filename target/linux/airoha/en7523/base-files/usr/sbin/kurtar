@@ -1,0 +1,170 @@
+#!/bin/sh
+# kurtar - EX3501 rescue / restore tool (lives in ROM).
+#
+# Normal system:
+#   kurtar kaydet [not]   save the current state as a known-good snapshot
+#   kurtar mod            reboot into rescue mode
+#   kurtar durum | liste  show state / snapshots
+# Rescue mode (EX3501-KURTARMA WiFi or LAN, ssh root@192.168.1.1):
+#   kurtar                restore the newest snapshot and reboot (= geri-al)
+#   kurtar geri-al [N]    restore snapshot N (see `kurtar liste`)
+#   kurtar onar           keep the current config, only undo package damage
+#                         (whiteouts hiding ROM files, apk database/world)
+#   kurtar bozugu-geri    put back the state saved before the last restore
+#   kurtar fabrika        empty overlay (factory defaults), old state kept
+#   kurtar normal         just reboot into the normal system
+
+. /lib/en7523-rescue.sh
+
+die() { echo "kurtar: $*" >&2; exit 1; }
+say() { echo "kurtar: $*"; }
+
+od=$(rescue_od rw) || die "rootfs_data (UBIFS) mount edilemedi"
+st=$od/$RESCUE_DIR
+mkdir -p "$st/snaps"
+
+snaps() { ls "$st/snaps/"*.tgz 2>/dev/null | sort; }
+
+pick_snap() {
+	local n=$1 s
+	[ -z "$n" ] && { snaps | tail -n1; return; }
+	for s in $(snaps); do
+		case "${s##*/}" in "$n"-*|"$n"|"$n".tgz) echo "$s"; return ;; esac
+	done
+}
+
+do_reboot() {
+	sync
+	rescue_od_release
+	say "yeniden baslatiliyor..."
+	if rescue_in_failsafe; then reboot -f; else reboot; fi
+	exit 0
+}
+
+reset_counters() {
+	echo 0 > "$st/bootcount"
+	rm -f "$st/request"
+}
+
+# Undo package damage on $od/upper: whiteouts that hide ROM files (except
+# uci-defaults, which are deleted on purpose after they ran) and the apk
+# database/world, so apk sees exactly the ROM's package set again.
+repair_upper() {
+	local rom=/rom n=0 p
+	rescue_in_failsafe && rom=
+	[ -d "$od/upper" ] || return 0
+	cd "$od/upper" || return 1
+	for p in $(find . -type c | sed 's|^\./||'); do
+		case "$p" in etc/uci-defaults/*) continue ;; esac
+		[ -e "$rom/$p" ] || [ -L "$rom/$p" ] || continue
+		rm -f "$p" && n=$((n + 1))
+	done
+	rm -f lib/apk/db/installed lib/apk/db/scripts.tar.gz lib/apk/db/triggers \
+		etc/apk/world
+	cd /
+	say "$n gizlenmis ROM dosyasi geri getirildi, apk veritabani ROM'a donduruldu"
+}
+
+swap_upper() {
+	# $1 = new upper contents: a snapshot file, or "empty"
+	rm -rf "$st/broken.old"
+	[ -d "$st/broken" ] && mv "$st/broken" "$st/broken.old"
+	[ -d "$od/upper" ] && mv "$od/upper" "$st/broken"
+	mkdir -p "$od/upper"
+	if [ "$1" != empty ]; then
+		tar xzf "$1" -C "$od/upper" || {
+			rm -rf "$od/upper"
+			mv "$st/broken" "$od/upper"
+			[ -d "$st/broken.old" ] && mv "$st/broken.old" "$st/broken"
+			die "anlik goruntu acilamadi, eski durum yerinde birakildi"
+		}
+	fi
+	rm -rf "$st/broken.old"
+	rm -rf "$od/work"
+	mkdir -p "$od/work"
+}
+
+cmd=${1:-}
+if [ -z "$cmd" ]; then
+	rescue_in_failsafe && cmd=geri-al || cmd=durum
+fi
+
+case "$cmd" in
+kaydet)
+	rescue_in_failsafe && die "kurtarma modunda kaydedilmez (bozuk durum kaydedilebilir)"
+	tag=$(printf %s "${2:-elle}" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-24)
+	last=$(snaps | tail -n1)
+	num=$(basename "${last:-0000}" | cut -c1-4)
+	num=$(echo "$num" | sed 's/^0*//')
+	case "$num" in ''|*[!0-9]*) num=0 ;; esac
+	name=$(printf '%04d' $((num + 1)))-$(date +%Y%m%d-%H%M)-$tag.tgz
+	tar czf "$st/snaps/$name.tmp" -C "$od/upper" . 2>/dev/null ||
+		{ rm -f "$st/snaps/$name.tmp"; die "anlik goruntu yazilamadi"; }
+	mv "$st/snaps/$name.tmp" "$st/snaps/$name"
+	extra=$(( $(snaps | wc -l) - RESCUE_KEEP_SNAPS ))
+	[ "$extra" -gt 0 ] && for s in $(snaps | head -n "$extra"); do rm -f "$s"; done
+	touch "$st/last-snapshot"
+	say "kaydedildi: $name ($(du -k "$st/snaps/$name" | cut -f1) KiB)"
+	;;
+mod)
+	rescue_in_failsafe && die "zaten kurtarma modundasin"
+	touch "$st/request"
+	say "bir sonraki acilis kurtarma modunda (WiFi EX3501-KURTARMA)"
+	do_reboot
+	;;
+geri-al)
+	rescue_in_failsafe || die "geri-al sadece kurtarma modunda calisir (once: kurtar mod)"
+	s=$(pick_snap "$2")
+	[ -n "$s" ] || die "anlik goruntu yok; 'kurtar onar' veya 'kurtar fabrika' dene"
+	swap_upper "$s"
+	reset_counters
+	say "geri yuklendi: ${s##*/} (onceki durum: $st/broken)"
+	do_reboot
+	;;
+onar)
+	rescue_in_failsafe || die "onar sadece kurtarma modunda calisir (once: kurtar mod)"
+	repair_upper
+	reset_counters
+	do_reboot
+	;;
+bozugu-geri)
+	rescue_in_failsafe || die "sadece kurtarma modunda"
+	[ -d "$st/broken" ] || die "geri alinacak eski durum yok"
+	mv "$od/upper" "$st/broken.swap" && mv "$st/broken" "$od/upper" &&
+		mv "$st/broken.swap" "$st/broken"
+	rm -rf "$od/work"; mkdir -p "$od/work"
+	reset_counters
+	say "geri-al oncesi duruma donuldu"
+	do_reboot
+	;;
+fabrika)
+	rescue_in_failsafe || die "sadece kurtarma modunda"
+	swap_upper empty
+	reset_counters
+	say "fabrika ayarlari (eski durum: $st/broken)"
+	do_reboot
+	;;
+normal)
+	reset_counters
+	do_reboot
+	;;
+durum|liste)
+	if rescue_in_failsafe; then
+		echo "Mod      : KURTARMA ($(cat /tmp/en7523_rescue_mode 2>/dev/null))"
+	else
+		echo "Mod      : normal"
+	fi
+	echo "Acilis   : $(cat "$st/bootcount" 2>/dev/null || echo 0) (limit $RESCUE_BOOT_LIMIT sagliksiz acilis)"
+	echo "Bos alan : $(df -k "$od" | awk 'NR==2 {print $4}') KiB"
+	echo "Anlik goruntuler:"
+	snaps | while read s; do
+		echo "  ${s##*/}  $(du -k "$s" | cut -f1) KiB"
+	done
+	[ -d "$st/broken" ] && echo "Eski durum (geri-al oncesi): var"
+	rescue_od_release
+	;;
+*)
+	sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+	exit 1
+	;;
+esac

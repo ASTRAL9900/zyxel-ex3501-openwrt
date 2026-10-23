@@ -1,0 +1,46 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: PCI: quirk EN7523 (MT7622-style) root ports: drop the bogus 8 GiB BAR0
+
+The MediaTek/Airoha root ports on EN7523 (14c3:0810 and 14c3:0811) expose a
+BAR0 that sizes to 0x200000000. The core cannot handle it ("can't handle
+BAR larger than 4GB", then "alignment must not be zero"), the resource stays
+IORESOURCE_UNSET, and pci_enable_bridge() fails with -EINVAL ("Error
+enabling bridge (-22), continuing"). The bridge therefore never gets
+PCI_COMMAND_MEMORY set (it reads 0x0144 out of reset).
+
+Real-hardware effect on the Zyxel EX3501-T0: the MT7916 behind it enumerates
+and its registers can be read, but every MCU message times out ("Failed to
+get patch semaphore", probe -11). Setting bit 1 of the root port's command
+register by hand and rebinding mt7915e makes the firmware load and the MCU
+answer immediately (verified 2026-09-25). Zero the BAR0 resource on these
+root ports so the bridge enables normally.
+
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -5598,6 +5598,26 @@
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_HUAWEI, 0xa22b, quirk_no_flr_snet);
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_MEDIATEK, 0x0616, quirk_no_flr);
+ 
++/*
++ * Airoha EN7523 (MT7622-style) PCIe root ports report an 8 GiB BAR0 that the
++ * core cannot size or assign; the unassigned resource then makes
++ * pci_enable_bridge() fail so the bridge never enables memory decoding and
++ * endpoints behind it cannot DMA. The BAR is not used for anything: drop it.
++ */
++static void quirk_airoha_en7523_root_port_bar(struct pci_dev *dev)
++{
++	struct resource *res = &dev->resource[0];
++
++	if (!res->flags)
++		return;
++
++	pci_info(dev, "dropping unusable root port BAR 0 %pR\n", res);
++	res->flags = 0;
++	res->start = res->end = 0;
++}
++DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_MEDIATEK, 0x0810, quirk_airoha_en7523_root_port_bar);
++DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_MEDIATEK, 0x0811, quirk_airoha_en7523_root_port_bar);
++
+ /* FLR may cause the SolidRun SNET DPU (rev 0x1) to hang */
+ static void quirk_no_flr_snet(struct pci_dev *dev)
+ {

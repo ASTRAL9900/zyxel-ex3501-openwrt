@@ -1,0 +1,781 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: net: airoha: add Airoha EN7523 SoC support
+
+Consolidated EN7523 (dual Cortex-A53 in AArch32, EN7581-lineage frame
+engine/QDMA/PPE) support, every item verified on a Zyxel EX3501-T0:
+
+- EN7523 SoC data (single PPE, 8 TX / 16 RX rings, no xfp-mac reset);
+- TX queue selection wraps into the 8 backed rings, every TX ring stays
+  on TX IRQ queue 0;
+- write REG_RX_CPU_IDX right after REG_RX_DMA_IDX with a dma_wmb(),
+  larger RX rings, honour soc->max_rx_ring;
+- deassert the GDMA reset, HW_FWD_DSCP_CFG/HW_DSCP_NUM/INGRESS_TRTCM,
+  GLOBAL_CFG and the undocumented 0x102c/0x00fc/0x0030 bits as on the
+  stock firmware, PSE page reservations scaled for the smaller PSE;
+- RX source port from msg1 bits 24..20 (0x10 | switch port) mapped to a
+  DSA metadata dst; the switch special tag travels in the descriptor
+  (see the mt7530 patch), GDM1 INGRESS_CFG = STAG_EN|FC_EN|BIT(2);
+- no hardware checksum/TSO/LRO offload (the stock firmware does not use
+  it either);
+- FE LAN/WAN MAC range registers cover base..base+15 so the PPE treats
+  frames for the bridge/WAN MACs as "for me";
+- PPE initialised from the CPU (no NPU object on this SoC) with the
+  stock register values, PPE fields of the RX descriptor decoded with
+  the EN7523 layout (15-bit FOE index, reason at bits 19..15), the NPU
+  cores booted directly from the reserved firmware region, and the
+  QDMA rings placed in the "eth-ring-buf" shared-dma-pool.
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -21,7 +21,7 @@
+ #define AIROHA_MAX_NUM_QDMA		2
+ #define AIROHA_MAX_NUM_IRQ_BANKS	4
+ #define AIROHA_MAX_DSA_PORTS		7
+-#define AIROHA_MAX_NUM_RSTS		3
++#define AIROHA_MAX_NUM_RSTS		4
+ #define AIROHA_MAX_MTU			9220
+ #define AIROHA_MAX_RX_SIZE		16128
+ #define AIROHA_MAX_PACKET_SIZE		2048
+@@ -36,14 +36,41 @@
+ #define AIROHA_NUM_TX_IRQ		2
+ #define AIROHA_RX_HEADROOM		(NET_SKB_PAD + NET_IP_ALIGN)
+ #define AIROHA_RX_LEN(_n)		((_n) - AIROHA_RX_HEADROOM)
+-#define HW_DSCP_NUM			2048
++/* FIX candidate (hypothesis 17a, retried): vendor's real, live
++ * LMGR_INIT_CFG has HW_FWD_DESC_NUM = 16384 (8x this driver's
++ * original 2048). A first attempt at this same value broke probe
++ * outright (ENOMEM) because no "qdma0-buf"/"qdma1-buf" reserved-memory
++ * region existed, forcing airoha_qdma_init_hfwd_queues()'s fallback
++ * path to attempt one raw 32MB dmam_alloc_coherent(). Now that
++ * en7523-base.dtsi declares those two named regions (sized exactly
++ * for num_desc=16384 at each instance's buf_size), the reserved-mem
++ * path in that function is taken instead, and this constant can
++ * finally be tested without breaking probe.
++ */
++#define HW_DSCP_NUM			16384
+ #define IRQ_QUEUE_LEN(_n)		((_n) ? 1024 : 2048)
+ #define TX_DSCP_NUM			1024
++/* FIX candidate (hypothesis 21): matches upstream commit e84b89f17a12
++ * ("net: airoha: grow the small RX rings", merged net-next 2026-09-04,
++ * verified in this investigation to genuinely exist and be authored/
++ * acked by real airoha maintainers -- fetched and read in full before
++ * applying, not taken on the user's paraphrase alone). That commit's
++ * own described symptom (small rings -- 16 desc -- livelocking under
++ * bursty PPPoE-class traffic, hw producer index lapping the strictly
++ * sequential software consumer so a real DONE=1 descriptor becomes
++ * permanently unreachable) is NOT the same failure mode as this
++ * board's bug (DONE bit never sets on ANY ring of ANY size, including
++ * the already-1024-deep ring 0, confirmed across 20 prior hypotheses
++ * and every ring size tested) -- so this is a real, verified upstream
++ * fix being tried here on low confidence that it's the same root
++ * cause, not high confidence.
++ */
+ #define RX_DSCP_NUM(_n)			\
+ 	((_n) ==  2 ? 128 :		\
++	 (_n) ==  4 ? 128 :		\
+ 	 (_n) == 11 ? 128 :		\
+ 	 (_n) == 15 ? 128 :		\
+-	 (_n) ==  0 ? 1024 : 16)
++	 (_n) ==  0 ? 1024 : 32)
+ 
+ #define AIROHA_LRO_PAGE_ORDER		order_base_2(SZ_16K / PAGE_SIZE)
+ #define AIROHA_MAX_NUM_LRO_QUEUES	8
+@@ -586,6 +613,16 @@
+ 
+ #define AIROHA_RXD4_PPE_CPU_REASON	GENMASK(20, 16)
+ #define AIROHA_RXD4_FOE_ENTRY		GENMASK(15, 0)
++/* EN7523 (hypothesis 34): the RX descriptor msg1 word carries the PPE
++ * fields in a different layout on this SoC.  Vendor qdma_lan.ko
++ * (qdma_int*_rx) extracts the CPU reason with "ubfx r3, msg1, #15, #5" and
++ * hw_nat.ko (PpeRxinfoHandler) treats the FOE index as 15 bits with 0x7fff
++ * meaning "no entry".  Decoding with the EN7581 masks above turned every
++ * HIT_UNBIND(0x0e)/RATE_REACHED(0x0f) into 0x07 and NO_FLOW(0x07) into 0x03
++ * (both observed live), so airoha_ppe_check_skb() was never called.
++ */
++#define AIROHA_RXD4_EN7523_PPE_CPU_REASON	GENMASK(19, 15)
++#define AIROHA_RXD4_EN7523_FOE_ENTRY		GENMASK(14, 0)
+ 
+ struct airoha_ppe {
+ 	struct airoha_ppe_dev dev;
+@@ -610,6 +647,11 @@
+ 	const char * const *xsi_rsts_names;
+ 	int num_xsi_rsts;
+ 	int num_ppe;
++	int max_rx_ring;
++	/* EN7523 only backs TX rings 0-7 (ring registers >= 8 read back
++	 * 0xdeadbeef); airoha_qdma_get_txq() wraps queue selection into them.
++	 */
++	int max_tx_ring;
+ 	struct {
+ 		int (*get_sport)(struct airoha_gdm_port *port, int nbq);
+ 		u32 (*get_vip_port)(struct airoha_gdm_port *port, int nbq);
+@@ -672,6 +714,11 @@
+ 
+ static inline u16 airoha_qdma_get_txq(struct airoha_qdma *qdma, u16 qid)
+ {
++	int max_tx_ring = qdma->eth->soc->max_tx_ring;
++
++	if (max_tx_ring)
++		return qid % max_tx_ring;
++
+ 	return qid % ARRAY_SIZE(qdma->q_tx);
+ }
+ 
+@@ -690,6 +737,26 @@
+ 	return eth->soc->version == 0x7583;
+ }
+ 
++static inline bool airoha_is_7523(struct airoha_eth *eth)
++{
++	return eth->soc->version == 0x7523;
++}
++
++/* EN7523 (hypothesis 34): the PPE FOE table uses 64-byte entries (vendor
++ * hw_nat.ko gPpeFoeSize = 0x40, REG_PPE_TB_CFG bit 3 clear).  Vendor
++ * PpeParseL2Info()/PpeFillInL2Info() show the layout equals the first 64
++ * bytes of struct airoha_foe_entry (ib1, tuples, ib2, data, then
++ * vlan1|etype, dmac_hi, vlan2|dmac_lo, smac_hi, pppoe|smac_lo), so only the
++ * table stride differs from EN7581.
++ */
++#define PPE_EN7523_ENTRY_SIZE		64
++
++static inline u32 airoha_ppe_entry_size(struct airoha_ppe *ppe)
++{
++	return airoha_is_7523(ppe->eth) ? PPE_EN7523_ENTRY_SIZE
++					: PPE_ENTRY_SIZE;
++}
++
+ static inline bool airoha_qdma_is_lro_queue(struct airoha_queue *q)
+ {
+ 	struct airoha_qdma *qdma = q->qdma;
+@@ -723,6 +790,7 @@
+ 			  u16 hash, bool rx_wlan);
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
+ int airoha_ppe_init(struct airoha_eth *eth);
++void airoha_ppe_en7523_hw_init(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+ u32 airoha_ppe_get_total_num_entries(struct airoha_ppe *ppe);
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -135,6 +135,26 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (airoha_is_7523(eth)) {
++		/* EN7523 (hypothesis 34): the PPE decides "packet is for me"
++		 * (L3 flow vs L2 bridge flow) with these registers.  The DSA
++		 * user ports / bridge use base MAC (+1 for wan) from U-Boot
++		 * env, not eth0's own address, so cover the whole 16-address
++		 * block in both the LAN and the WAN register set (vendor stock
++		 * firmware: WAN range 5d7b40..5d7b4b, LAN 5d7b48).
++		 */
++		lmin &= ~0xf;
++		lmax = lmin | 0xf;
++		val = (addr[0] << 16) | (addr[1] << 8) | addr[2];
++		airoha_fe_wr(eth, REG_FE_WAN_MAC_H, val);
++		airoha_fe_wr(eth, REG_FE_MAC_LMIN(REG_FE_WAN_MAC_H), lmin);
++		airoha_fe_wr(eth, REG_FE_MAC_LMAX(REG_FE_WAN_MAC_H), lmax);
++		airoha_fe_wr(eth, REG_FE_LAN_MAC_H, val);
++		airoha_fe_wr(eth, REG_FE_MAC_LMIN(REG_FE_LAN_MAC_H), lmin);
++		airoha_fe_wr(eth, REG_FE_MAC_LMAX(REG_FE_LAN_MAC_H), lmax);
++		return 0;
++	}
++
+ 	reg = airoha_is_lan_gdm_dev(dev) ? REG_FE_LAN_MAC_H : REG_FE_WAN_MAC_H;
+ 	val = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+ 	airoha_fe_wr(eth, reg, val);
+@@ -298,6 +318,20 @@
+ 	u32 orig_val = airoha_fe_get_pse_queue_rsv_pages(eth, port, queue);
+ 	u32 tmp, all_rsv, fq_limit;
+ 
++	/* FIX candidate (hypothesis 28): EN7523's PSE is much smaller than
++	 * EN7581's. Live vendor dump: PSE_FQ_CFG limit=0x500 (1280 pages),
++	 * PSE_BUF_SET ALLRSV=0x2b4 (692), SHARE_USED_THD=0x01e001f4. This
++	 * driver, with its EN7581-sized per-queue reservations, ends up
++	 * with ALLRSV=0x9ec (2540) against a 1024-page default limit, so
++	 * the subtraction below wraps: 1024-2540-0x20 = 0xf9f4 and
++	 * 1024-2540-0x100 = 0xf914, exactly the 0xf914f9f4 read back on
++	 * real hardware. Scale every per-queue reservation down 4x on
++	 * EN7523 so the total (~635) lands near vendor's 692 and the
++	 * thresholds become sane positive values.
++	 */
++	if (eth->soc->version == 0x7523)
++		val /= 4;
++
+ 	airoha_fe_set_pse_queue_rsv_pages(eth, port, queue, val);
+ 
+ 	/* modify all rsv */
+@@ -342,12 +376,21 @@
+ 	};
+ 	int q;
+ 
++	/* FIX candidate (hypothesis 28), see airoha_fe_set_pse_oq_rsv():
++	 * vendor programs the PSE free-queue limit to 0x500 on this SoC
++	 * (hardware default reads 0x400 and this driver never wrote it).
++	 */
++	if (eth->soc->version == 0x7523)
++		airoha_fe_rmw(eth, PSE_FQ_CFG, PSE_FQ_LIMIT_MASK,
++			      FIELD_PREP(PSE_FQ_LIMIT_MASK, 0x500));
++
+ 	if (airoha_ppe_is_enabled(eth, 1)) {
+ 		u32 all_rsv;
+ 
+ 		/* hw misses PPE2 oq rsv */
+ 		all_rsv = airoha_fe_get_pse_all_rsv(eth);
+-		all_rsv += PSE_RSV_PAGES *
++		all_rsv += (eth->soc->version == 0x7523 ? PSE_RSV_PAGES / 4 :
++						       PSE_RSV_PAGES) *
+ 			   pse_port_num_queues[FE_PSE_PORT_PPE2];
+ 		airoha_fe_rmw(eth, REG_FE_PSE_BUF_SET, PSE_ALLRSV_MASK,
+ 			      FIELD_PREP(PSE_ALLRSV_MASK, all_rsv));
+@@ -590,10 +633,13 @@
+ 		      FIELD_PREP(GDM_SPORT_OFF1_MASK, 8) |
+ 		      FIELD_PREP(GDM_SPORT_OFF0_MASK, 8));
+ 
+-	/* set PSE Page as 128B */
++	/* set PSE Page as 128B. Hypothesis 28: vendor's live EN7523
++	 * REG_FE_DMA_GLO_CFG (0x884c1439) carries L2_SPACE=3, not 2.
++	 */
+ 	airoha_fe_rmw(eth, REG_FE_DMA_GLO_CFG,
+ 		      FE_DMA_GLO_L2_SPACE_MASK | FE_DMA_GLO_PG_SZ_MASK,
+-		      FIELD_PREP(FE_DMA_GLO_L2_SPACE_MASK, 2) |
++		      FIELD_PREP(FE_DMA_GLO_L2_SPACE_MASK,
++				 eth->soc->version == 0x7523 ? 3 : 2) |
+ 		      FE_DMA_GLO_PG_SZ_MASK);
+ 	airoha_fe_wr(eth, REG_FE_RST_GLO_CFG,
+ 		     FE_RST_CORE_MASK | FE_RST_GDM3_MBI_ARB_MASK |
+@@ -701,10 +747,31 @@
+ 		WRITE_ONCE(desc->msg3, 0);
+ 	}
+ 
+-	if (nframes)
++	if (nframes) {
++		/* FIX candidate (hypothesis 20): a much more actively developed
++		 * downstream fork of the EN7523 driver effort (Sirherobrine23/
++		 * openwrt, branch airoha_en7523, commit 6e1efd628563 "net:
++		 * airoha: fix EN7523 OMCI RX descriptor ownership", 2026-07-17)
++		 * adds this exact dma_wmb() here, unconditionally for all SoCs/
++		 * queues, with the rationale: "Publish RX descriptor contents
++		 * with dma_wmb() before updating the CPU producer index. This
++		 * prevents QDMA from observing stale buffer addresses or
++		 * next-descriptor links." Our driver's WRITE_ONCE() calls above
++		 * only prevent compiler reordering, not a real memory barrier
++		 * against the following MMIO register write -- on this weakly-
++		 * ordered ARM core, the hardware could observe an advanced
++		 * CPU_IDX before the descriptor's own addr/ctrl/data fields are
++		 * actually visible in DRAM, which would plausibly explain
++		 * hardware refusing to ever mark the descriptor DONE. This is a
++		 * genuinely new hypothesis (not order between CPU_IDX/DMA_IDX,
++		 * tried and refuted as hypothesis 18) sourced from real,
++		 * continued upstream development, not guesswork.
++		 */
++		dma_wmb();
+ 		airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid),
+ 				RX_RING_CPU_IDX_MASK,
+ 				FIELD_PREP(RX_RING_CPU_IDX_MASK, q->head));
++	}
+ 
+ 	return nframes;
+ }
+@@ -900,6 +967,7 @@
+ 		struct airoha_queue_entry *e = &q->entry[q->tail];
+ 		struct airoha_qdma_desc *desc = &q->desc[q->tail];
+ 		u32 hash, reason, msg1, desc_ctrl;
++		bool hash_valid;
+ 		struct airoha_gdm_dev *dev;
+ 		struct net_device *netdev;
+ 		int data_len, len;
+@@ -947,7 +1015,29 @@
+ 		if (FIELD_GET(QDMA_DESC_MORE_MASK, desc_ctrl))
+ 			continue;
+ 
+-		if (netdev_uses_dsa(netdev)) {
++		/* EN7523 (hypothesis 30): the FE puts the 4-byte MT7530 special
++		 * tag *inside the frame* (raw DRAM dump of a received ARP:
++		 * dst | src | 00 04 00 00 | 08 06 ...) and reports nothing in
++		 * msg0 (sptag reads 0). Mainline's metadata-dst shortcut below
++		 * assumes an untagged frame plus a descriptor-provided port, so
++		 * on EN7523 it pins every frame to port 0 and stops tag_mtk from
++		 * stripping the in-band tag (ethertype becomes 0x0004, the
++		 * bridge never sees a valid ARP). Skip it and let the DSA
++		 * tagger parse the in-band tag exactly as it would on any
++		 * ordinary mt7530 conduit.
++		 */
++		if (netdev_uses_dsa(netdev) && airoha_is_7523(eth)) {
++			struct airoha_gdm_port *port = dev->port;
++			u32 m1 = le32_to_cpu(READ_ONCE(desc->msg1));
++			u32 sport = FIELD_GET(GENMASK(24, 20), m1);
++			u32 sptag = sport & 0xf;
++
++			if ((sport & 0x10) && sptag < ARRAY_SIZE(port->dsa_meta) &&
++			    port->dsa_meta[sptag])
++				skb_dst_set_noref(q->skb,
++						  &port->dsa_meta[sptag]->dst);
++		} else if (netdev_uses_dsa(netdev) &&
++		    q->qdma->eth->soc->version != 0x7523) {
+ 			struct airoha_gdm_port *port = dev->port;
+ 
+ 			/* PPE module requires untagged packets to work
+@@ -965,12 +1055,21 @@
+ 		}
+ 
+ 		msg1 = le32_to_cpu(READ_ONCE(desc->msg1));
+-		hash = FIELD_GET(AIROHA_RXD4_FOE_ENTRY, msg1);
+-		if (hash != AIROHA_RXD4_FOE_ENTRY)
++		if (airoha_is_7523(eth)) {
++			/* EN7523: 15-bit FOE index, CPU reason at bits 19..15 */
++			hash = FIELD_GET(AIROHA_RXD4_EN7523_FOE_ENTRY, msg1);
++			hash_valid = hash != AIROHA_RXD4_EN7523_FOE_ENTRY;
++			reason = FIELD_GET(AIROHA_RXD4_EN7523_PPE_CPU_REASON,
++					   msg1);
++		} else {
++			hash = FIELD_GET(AIROHA_RXD4_FOE_ENTRY, msg1);
++			hash_valid = hash != AIROHA_RXD4_FOE_ENTRY;
++			reason = FIELD_GET(AIROHA_RXD4_PPE_CPU_REASON, msg1);
++		}
++		if (hash_valid)
+ 			skb_set_hash(q->skb, jhash_1word(hash, 0),
+ 				     PKT_HASH_TYPE_L4);
+ 
+-		reason = FIELD_GET(AIROHA_RXD4_PPE_CPU_REASON, msg1);
+ 		if (reason == PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED)
+ 			airoha_ppe_check_skb(&eth->ppe->dev, q->skb, hash,
+ 					     false);
+@@ -1073,6 +1172,11 @@
+ 			FIELD_PREP(RX_RING_THR_MASK, thr));
+ 	airoha_qdma_rmw(qdma, REG_RX_DMA_IDX(qid), RX_RING_DMA_IDX_MASK,
+ 			FIELD_PREP(RX_RING_DMA_IDX_MASK, q->head));
++	/* EN7523 (like its vendor U-Boot driver): post the whole ring right
++	 * after REG_RX_DMA_IDX, before the incremental refill loop.
++	 */
++	airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK,
++			FIELD_PREP(RX_RING_CPU_IDX_MASK, ndesc - 1));
+ 	if (lro_q)
+ 		airoha_qdma_clear(qdma, REG_RX_SCATTER_CFG(qid),
+ 				  RX_RING_SG_EN_MASK);
+@@ -1125,6 +1229,7 @@
+ 
+ static int airoha_qdma_init_rx(struct airoha_qdma *qdma)
+ {
++	int max_rx_ring = qdma->eth->soc->max_rx_ring;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
+@@ -1135,6 +1240,10 @@
+ 			continue;
+ 		}
+ 
++		/* EN7523 only implements 16 RX rings */
++		if (max_rx_ring && i >= max_rx_ring)
++			continue;
++
+ 		err = airoha_qdma_init_rx_queue(&qdma->q_rx[i], qdma,
+ 						RX_DSCP_NUM(i));
+ 		if (err)
+@@ -1486,10 +1595,17 @@
+ 		return -ENOMEM;
+ 
+ 	airoha_qdma_wr(qdma, REG_FWD_DSCP_BASE, dma_addr);
+-	/* QDMA0: 2KB. QDMA1: 1KB */
++	/* FIX candidate: vendor's real, live HW_FWD_DSCP_CFG (live SSH
++	 * register dump) has PAYLOAD_SIZE_MASK = 1 (1KB) on BOTH qdma
++	 * instances, not just qdma1 -- this driver's original "QDMA0: 2KB,
++	 * QDMA1: 1KB" split (FIELD_PREP(..., !!id)) only matched the
++	 * vendor on qdma1; qdma0 (the LAN instance actually under test)
++	 * differed. Found via the same systematic register sweep as the
++	 * INGRESS_TRTCM_CFG fix above.
++	 */
+ 	airoha_qdma_rmw(qdma, REG_HW_FWD_DSCP_CFG,
+ 			HW_FWD_DSCP_PAYLOAD_SIZE_MASK,
+-			FIELD_PREP(HW_FWD_DSCP_PAYLOAD_SIZE_MASK, !!id));
++			FIELD_PREP(HW_FWD_DSCP_PAYLOAD_SIZE_MASK, 1));
+ 	airoha_qdma_rmw(qdma, REG_FWD_DSCP_LOW_THR, FWD_DSCP_LOW_THR_MASK,
+ 			FIELD_PREP(FWD_DSCP_LOW_THR_MASK, 128));
+ 	airoha_qdma_rmw(qdma, REG_LMGR_INIT_CFG,
+@@ -1512,6 +1628,30 @@
+ 	airoha_qdma_clear(qdma, REG_PSE_BUF_USAGE_CFG,
+ 			  PSE_BUF_ESTIMATE_EN_MASK);
+ 
++	/* FIX candidate (hypothesis 19): reverse-engineered directly from
++	 * the vendor's real, working qdma_lan.ko kernel module (a proper,
++	 * unstripped, relocatable ELF with full symbols/relocations,
++	 * downloaded live off the router's stock firmware and decompiled
++	 * in Ghidra -- unlike the flat, xref-broken kernel_raw.bin used
++	 * earlier this investigation, this file's symbols/relocations let
++	 * Ghidra decompile it cleanly). qdma_dev_init() unconditionally
++	 * sets bit 7 of offset 0x102c, immediately after the
++	 * PSE_BUF_USAGE_CFG (0x1028) write this driver already does at
++	 * this exact point in its own init sequence. 0x102c falls in a
++	 * real, previously-undocumented gap in this driver's register map
++	 * (between REG_PSE_BUF_USAGE_CFG=0x1028 and REG_CHAN_QOS_MODE(0)=
++	 * 0x1040) -- it was never named here, and being a one-time,
++	 * unconditional init-time write (not something that changes with
++	 * traffic), it would not have been caught by hypothesis 12's
++	 * before/after blind register scan either. Every other register
++	 * this same vendor function touches (GLOBAL_CFG, TXWRR_MODE_CFG,
++	 * EGRESS_RATE_METER_CFG, TXQ_CNGST_CFG, RX_DELAY_INT_IDX) was
++	 * independently confirmed byte-for-byte identical to what this
++	 * driver already does -- 0x102c is the one write with no existing
++	 * counterpart anywhere in this driver.
++	 */
++	airoha_qdma_set(qdma, 0x102c, BIT(7));
++
+ 	airoha_qdma_set(qdma, REG_EGRESS_RATE_METER_CFG,
+ 			EGRESS_RATE_METER_EN_MASK |
+ 			EGRESS_RATE_METER_EQ_RATE_EN_MASK);
+@@ -1539,8 +1679,15 @@
+ 			FIELD_PREP(EGRESS_SLOW_TICK_RATIO_MASK, 40));
+ 
+ 	airoha_qdma_set(qdma, REG_INGRESS_TRTCM_CFG, INGRESS_TRTCM_EN_MASK);
+-	airoha_qdma_clear(qdma, REG_INGRESS_TRTCM_CFG,
+-			  INGRESS_TRTCM_MODE_MASK);
++	/* FIX candidate: vendor's real, live INGRESS_TRTCM_CFG (read via
++	 * live SSH register dump this investigation) has MODE_MASK (bit
++	 * 30) SET; this driver always cleared it. Found via a systematic
++	 * bit-for-bit sweep of every named, non-per-ring QDMA config
++	 * register against the vendor's captured values, after GLOBAL_CFG
++	 * itself was fully ruled out (hypothesis 16).
++	 */
++	airoha_qdma_set(qdma, REG_INGRESS_TRTCM_CFG,
++			INGRESS_TRTCM_MODE_MASK);
+ 	airoha_qdma_rmw(qdma, REG_INGRESS_TRTCM_CFG, INGRESS_FAST_TICK_MASK,
+ 			FIELD_PREP(INGRESS_FAST_TICK_MASK, 125));
+ 	airoha_qdma_rmw(qdma, REG_INGRESS_TRTCM_CFG,
+@@ -1603,7 +1750,19 @@
+ 		if (!qdma->q_tx[i].ndesc)
+ 			continue;
+ 
+-		if (TX_RING_IRQ_BLOCKING_MAP_MASK & BIT(i))
++		/* EN7523 (hypothesis 32): a ring bound to TX IRQ queue 1
++		 * never gets its completions reaped -- the hardware never
++		 * writes an entry into the IRQ queue 1 memory programmed at
++		 * REG_TX_IRQ_BASE(1), so the first descriptor's DONE is
++		 * never seen, BQL stops that netdev queue after one packet
++		 * and every skb with that priority (dropbear's SYN-ACKs,
++		 * priority 6 -> ring 6) is lost. IRQ queue 0 works for all
++		 * other rings, so keep every ring on it on this SoC.
++		 */
++		if (qdma->eth->soc->version == 0x7523)
++			airoha_qdma_clear(qdma, REG_TX_RING_BLOCKING(i),
++					  TX_RING_IRQ_BLOCKING_CFG_MASK);
++		else if (TX_RING_IRQ_BLOCKING_MAP_MASK & BIT(i))
+ 			airoha_qdma_set(qdma, REG_TX_RING_BLOCKING(i),
+ 					TX_RING_IRQ_BLOCKING_CFG_MASK);
+ 		else
+@@ -1611,7 +1770,28 @@
+ 					  TX_RING_IRQ_BLOCKING_CFG_MASK);
+ 	}
+ 
++	/* FIX candidate (supersedes the earlier, refuted CHECK_DONE guess):
++	 * a direct, bit-by-bit comparison of this exact register's live
++	 * value against the vendor's real, working stock firmware (read
++	 * from an already-captured full register dump taken over live SSH
++	 * this same investigation) found this driver's GLOBAL_CFG write
++	 * differs from the vendor's actual value in exactly two bits:
++	 *   bit 31 (GLOBAL_CFG_RX_2B_OFFSET_MASK): vendor=1, ours=0
++	 *   bit  7 (GLOBAL_CFG_CHECK_DONE_MASK):   vendor=0, ours=1
++	 * (every other bit already matched). CHECK_DONE was an earlier,
++	 * already-tested-and-refuted guess (real-hardware test: zero
++	 * effect on RX) -- dropped here since the vendor's real, working
++	 * firmware runs without it. RX_2B_OFFSET is a genuinely new,
++	 * previously-untested candidate: a common RX-DMA feature that
++	 * shifts where hardware starts writing a frame into the buffer by
++	 * 2 bytes (typically to land the IP header on a 4-byte boundary
++	 * after the 14-byte Ethernet header) -- if EN7523 silicon requires
++	 * this bit to match its actual buffer-layout expectations before
++	 * it will perform the RX descriptor write-back step at all, this
++	 * would directly explain the whole investigation's core symptom.
++	 */
+ 	airoha_qdma_wr(qdma, REG_QDMA_GLOBAL_CFG,
++		       GLOBAL_CFG_RX_2B_OFFSET_MASK |
+ 		       FIELD_PREP(GLOBAL_CFG_DMA_PREFERENCE_MASK, 3) |
+ 		       GLOBAL_CFG_CPU_TXR_RR_MASK |
+ 		       GLOBAL_CFG_PAYLOAD_BYTE_SWAP_MASK |
+@@ -1621,6 +1801,45 @@
+ 		       GLOBAL_CFG_TX_WB_DONE_MASK |
+ 		       FIELD_PREP(GLOBAL_CFG_MAX_ISSUE_NUM_MASK, 2));
+ 
++	/* FIX candidate v2: undocumented register at offset 0x00fc (no
++	 * name in airoha_regs.h -- lives in the dark 0x006c-0x00fc gap
++	 * before the TX ring block begins at 0x0100). v1 of this
++	 * experiment (RMW forcing only bits 31:30 to match the vendor's
++	 * live value) was tested on real hardware and had ZERO effect --
++	 * ping still 100% packet loss, airoha_rxring_dump cmp -l still
++	 * completely empty. Escalating to an unconditional full 32-bit
++	 * write of the vendor's exact observed value (0xe0000092, read on
++	 * their actively-used LAN qdma instance) instead of a partial RMW,
++	 * in case the low bits our own driver currently has set here
++	 * (0x200700be, hardware/reset-default state, never written by any
++	 * code before this patch) are also load-bearing and not just
++	 * incidental queue-count/state reflection as first assumed.
++	 */
++	airoha_qdma_wr(qdma, 0x00fc, 0xe0000092);
++
++	/* FIX candidate (hypothesis 26): two more undocumented offsets (no
++	 * name in airoha_regs.h) found via a fresh live register-dump diff
++	 * against vendor's real, working LAN qdma instance (same technique
++	 * as the 0x00fc fix above, this time a full 2KB dump compared
++	 * word-for-word instead of a hand-picked scan). Every other
++	 * difference in that diff was either an expected DRAM-address
++	 * mismatch (different ring/buffer physical addresses between this
++	 * build and vendor's own memory layout), a pure traffic-driven
++	 * counter (TX_CPU_IDX/TX_DMA_IDX and their 0x0610-0x0618 mirror,
++	 * which climb with real TX traffic on both systems), or the
++	 * already-tested-and-refuted 0x00fc case above -- except this one:
++	 * offset 0x0030/0x0034 read *completely zero* on this driver
++	 * (confirmed via grep: never written anywhere before this patch,
++	 * pure hardware reset-default) while vendor's live, working LAN
++	 * qdma reads a real, structured, non-counter value there
++	 * (0x7c000000 / 0x7c007c00 -- the 0x7c00 half-word repeats,
++	 * suggesting a threshold/limit pair rather than an address or a
++	 * monotonic counter). Real-hardware-tested candidate, not yet
++	 * confirmed.
++	 */
++	airoha_qdma_wr(qdma, 0x0030, 0x7c000000);
++	airoha_qdma_wr(qdma, 0x0034, 0x7c007c00);
++
+ 	airoha_qdma_init_qos(qdma);
+ 
+ 	/* disable qdma rx delay interrupt */
+@@ -1828,6 +2047,47 @@
+ 	if (err)
+ 		goto error;
+ 
++	/* FIX candidate (hypothesis 23): live vendor register comparison via
++	 * SSH root shell on the stock firmware (real, working RX) found that
++	 * GDM1's forward target is pse_port=FE_PSE_PORT_PPE1 on vendor's
++	 * firmware too (REG_GDM_FWD_CFG(1)=0x07f04444, UCFQ=BCFQ=MCFQ=OCFQ=4
++	 * -- byte-for-byte the same as our own driver's default, confirming
++	 * hypothesis 22's "bypass PPE" theory was pointed the wrong way and
++	 * explaining why it had no effect). The real difference: vendor's
++	 * PPE1 is genuinely enabled and initialized --
++	 * REG_PPE_GLO_CFG(0)=0x00038743 (bit 0, PPE_GLO_CFG_EN_MASK, SET),
++	 * REG_PPE_DFT_CPORT(0, AIROHA_GDM1_IDX) bits [7:4] = 0 = CDM1 (the
++	 * "no matching flow, forward to CPU" target), REG_PPE_TB_BASE(0) =
++	 * a real DRAM physical address (0x98100000, a genuinely allocated
++	 * flow table, not zero/garbage), REG_PPE_HASH_SEED(0) = 0x12345678
++	 * (byte-for-byte identical to this driver's own PPE_HASH_SEED
++	 * constant). On this board, airoha_ppe_hw_init() -- the only
++	 * function that programs TB_BASE/HASH_SEED/DFT_CPORT -- and
++	 * PPE_GLO_CFG_EN_MASK itself (never written anywhere in this driver
++	 * at all -- confirmed by grep; it must normally be set by NPU
++	 * firmware's own ppe_init() op) are both reachable only via
++	 * airoha_ppe_offload_setup(), gated behind npu->ops.ppe_init(npu),
++	 * which requires an "npu" DT node this board's en7523-base.dtsi does
++	 * not declare (confirmed absent earlier this investigation). PPE is
++	 * therefore structurally never initialized on this board via any
++	 * existing code path, tc/nftables offload configured or not -- yet
++	 * every GDM1 frame is unconditionally aimed at it by default. This
++	 * would explain the RX bug at a point upstream of every QDMA
++	 * register examined by hypotheses 1-22: replicate vendor's minimal
++	 * real PPE1 init here directly, independent of NPU, using the
++	 * already-unconditionally-allocated eth->ppe->foe_dma table (real
++	 * hardware test pending).
++	 */
++	if (eth->soc->version == 0x7523) {
++		/* Hypothesis 34: the full table configuration (flow types,
++		 * table size, search-miss policy, aging, bind rate) lives in
++		 * airoha_ppe_hw_init(), which is only reachable through the
++		 * NPU offload setup and therefore never ran here.  Program
++		 * it from the CPU like vendor hw_nat.ko does on this SoC.
++		 */
++		airoha_ppe_en7523_hw_init(eth);
++	}
++
+ 	set_bit(DEV_STATE_INITIALIZED, &eth->state);
+ 
+ 	return 0;
+@@ -2135,6 +2395,18 @@
+ 	qdma = airoha_qdma_deref(dev);
+ 	qdma_id = qdma - &eth->qdma[0];
+ 
++	/* Hypothesis 22 (bypass PPE entirely for GDM traffic on this SoC) was
++	 * tested on real hardware and refuted -- and a live vendor-firmware
++	 * register comparison (SSH root shell, stock firmware) subsequently
++	 * showed *why*: vendor's own working firmware also routes GDM1 to
++	 * pse_port=FE_PSE_PORT_PPE1 (REG_GDM_FWD_CFG(1)=0x07f04444, byte-for-
++	 * byte the same as this driver's untouched default), it just also
++	 * genuinely initializes PPE1 (see the new PPE-init block added in
++	 * airoha_probe(), hypothesis 23) instead of leaving it disabled. Do
++	 * not re-bypass PPE here -- reverted back to the unconditional
++	 * default below.
++	 */
++
+ 	if (qdma->users && airoha_fe_lro_is_enabled(eth, qdma_id)) {
+ 		netdev_warn(netdev, "required to disable HW GRO on QDMA%d\n",
+ 			    qdma_id);
+@@ -2155,7 +2427,11 @@
+ 		return err;
+ 
+ 	/* It seems GDM3 and GDM4 needs SPORT enabled to correctly work */
+-	if (netdev_uses_dsa(netdev) || port->id > 2)
++	if (airoha_is_7523(eth) && netdev_uses_dsa(netdev))
++		/* stock firmware: STAG_EN | FC_EN | BIT(2) (unnamed) */
++		airoha_fe_set(eth, REG_GDM_INGRESS_CFG(port->id),
++			      GDM_STAG_EN_MASK | GDM_INGRESS_FC_EN_MASK | BIT(2));
++	else if (netdev_uses_dsa(netdev) || port->id > 2)
+ 		airoha_fe_set(eth, REG_GDM_INGRESS_CFG(port->id),
+ 			      GDM_STAG_EN_MASK);
+ 	else
+@@ -3360,8 +3636,12 @@
+ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
+ 	struct airoha_eth *eth = dev->eth;
+ 
+-	if (!tc_can_offload(netdev))
++	if (!tc_can_offload(netdev)) {
++		if (airoha_is_7523(eth))
++			pr_info_ratelimited("en7523 ppe: %s cannot offload tc (features %llx)\n",
++					    netdev->name, (u64)netdev->features);
+ 		return -EOPNOTSUPP;
++	}
+ 
+ 	switch (type) {
+ 	case TC_SETUP_CLSFLOWER:
+@@ -3870,6 +4150,26 @@
+ 	netdev->hw_features = AIROHA_HW_FEATURES | NETIF_F_LRO;
+ 	netdev->features |= AIROHA_HW_FEATURES;
+ 	netdev->vlan_features = AIROHA_HW_FEATURES;
++	/* EN7523 (hypothesis 31): once L2/L3 came up (h28-h30: 200/200 ping,
++	 * ARP fine), TCP still fails in both directions (SSH SYN never
++	 * answered, router->host nc hangs) while ICMP is perfect. The
++	 * remaining difference between ICMP and TCP here is hardware
++	 * checksum offload (TCO/UCO/ICO in the TX descriptor, L4-valid bits
++	 * read from msg1 on RX -- and msg1's bit layout is already known to
++	 * differ from EN7581, see h29). Run with software checksums and no
++	 * TSO/LRO on this SoC; offload can be re-enabled once its EN7523
++	 * descriptor encoding is verified.
++	 */
++	if (eth->soc->version == 0x7523) {
++		netdev_features_t off = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
++					NETIF_F_HW_CSUM | NETIF_F_TSO |
++					NETIF_F_TSO6 | NETIF_F_GSO_PARTIAL |
++					NETIF_F_LRO | NETIF_F_RXCSUM;
++
++		netdev->hw_features &= ~off;
++		netdev->features &= ~off;
++		netdev->vlan_features &= ~off;
++	}
+ 	SET_NETDEV_DEV(netdev, eth->dev);
+ 
+ 	/* reserve hw queues for HTB offloading */
+@@ -4042,6 +4342,16 @@
+ 		return err;
+ 	}
+ 
++	/* EN7523 boards declare a shared-dma-pool ("eth-ring-buf") for the
++	 * QDMA rings; other boards do not have it (-ENODEV is fine).
++	 */
++	err = of_reserved_mem_device_init_by_name(eth->dev, eth->dev->of_node,
++						  "eth-ring-buf");
++	if (err && err != -ENODEV)
++		dev_warn(eth->dev,
++			 "failed to init eth-ring-buf reserved memory: %d\n",
++			 err);
++
+ 	eth->fe_regs = devm_platform_ioremap_resource_byname(pdev, "fe");
+ 	if (IS_ERR(eth->fe_regs))
+ 		return dev_err_probe(eth->dev, PTR_ERR(eth->fe_regs),
+@@ -4050,6 +4360,16 @@
+ 	eth->rsts[0].id = "fe";
+ 	eth->rsts[1].id = "pdma";
+ 	eth->rsts[2].id = "qdma";
++	/* FIX candidate: "gdma" reset (EN7523_GDMA_RST), added to the DTS
++	 * this same session -- see en7523-base.dtsi's frame_engine node
++	 * comment for the full real-hardware evidence (live vendor
++	 * /proc/interrupts shows a real, traffic-driven "qdma_lan_int1"
++	 * interrupt with no home in our current interrupts list, tracing
++	 * back to an "econet,ecnt-gdma" hardware block at 0x1fb30000 that
++	 * our devicetree has never had any node -- or reset deassertion --
++	 * for at all).
++	 */
++	eth->rsts[3].id = "gdma";
+ 	err = devm_reset_control_bulk_get_exclusive(eth->dev,
+ 						    ARRAY_SIZE(eth->rsts),
+ 						    eth->rsts);
+@@ -4346,6 +4666,78 @@
+ 	return 0;
+ }
+ 
++/*
++ * EN7523 has no dedicated match_data upstream; this driver was written for
++ * the AN7581 (per PR #20104 discussion) and its en7581_soc_data was being
++ * reached via a fallback "airoha,en7581-eth" compatible in our board DTS.
++ * That unconditionally requests a "xfp-mac" reset via
++ * devm_reset_control_bulk_get_exclusive() during probe -- EN7523 has no
++ * XFP/10G port and no such reset line exists (confirmed: no XFP_* constant
++ * anywhere in include/dt-bindings/reset/airoha,en7523-reset.h, unlike the
++ * EN7581/AN7583 headers), so probe failed immediately with -ENOENT/-EINVAL
++ * before ever reaching WiFi/PCIe-adjacent code.
++ *
++ * .ops below are reused as-is from en7581_soc_data: our board DTS only
++ * defines GDM1/GDM2/GDM-WAN style basic ports (eth_ephy/hsgmii_lan/
++ * qdma_wan), none of which hit the AIROHA_GDM3_IDX/AIROHA_GDM4_IDX
++ * PCIe-or-USB-on-SerDes cases these callbacks special-case -- they fall
++ * through to their existing "return -EINVAL"/0 default for anything else,
++ * which is the correct behavior for our simpler port set regardless. This
++ * is untested/experimental: the goal is getting probe() past the reset
++ * acquisition step to see what the next real blocker is, not a claim that
++ * every field here is hardware-verified correct for EN7523.
++ */
++static const char * const en7523_xsi_rsts_names[] = {
++	"hsi0-mac",
++	"hsi1-mac",
++	"hsi-mac",
++};
++
++/* EN7523 (hypothesis 29): once RX completion started working (h28), every
++ * received frame was rejected by get_dev_from_sport() with sport=0x8 from
++ * msg1=0x0103ffff. Vendor's eth.ko eth_rx() reads the source port from
++ * bits 24..20 of msg1 (ldrh at rxinfo+6, "and #0x1f0"), one bit below
++ * mainline's GENMASK(25, 21); the same msg1 decodes to 0x10 there, which
++ * is exactly the GDM1 value in the EN7581 table below. Same switch, shifted
++ * field.
++ */
++#define QDMA_ETH_RXMSG_SPORT_7523_MASK	GENMASK(24, 20)
++
++static int airoha_en7523_get_dev_from_sport(struct airoha_qdma_desc *desc,
++					    u16 *port, u16 *dev)
++{
++	u32 sport = FIELD_GET(QDMA_ETH_RXMSG_SPORT_7523_MASK,
++			      le32_to_cpu(READ_ONCE(desc->msg1)));
++
++	*dev = 0;
++	switch (sport) {
++	case 0x10 ... 0x14:
++		*port = 0; /* GDM1 */
++		break;
++	case 0x2 ... 0x4:
++		*port = sport - 1;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static const struct airoha_eth_soc_data en7523_soc_data = {
++	.version = 0x7523,
++	.xsi_rsts_names = en7523_xsi_rsts_names,
++	.num_xsi_rsts = ARRAY_SIZE(en7523_xsi_rsts_names),
++	.num_ppe = 1,
++	.max_rx_ring = 16,
++	.max_tx_ring = 8,
++	.ops = {
++		.get_sport = airoha_en7581_get_sport,
++		.get_vip_port = airoha_en7581_get_vip_port,
++		.get_dev_from_sport = airoha_en7523_get_dev_from_sport,
++	},
++};
++
+ static const struct airoha_eth_soc_data en7581_soc_data = {
+ 	.version = 0x7581,
+ 	.xsi_rsts_names = en7581_xsi_rsts_names,
+@@ -4371,6 +4763,7 @@
+ };
+ 
+ static const struct of_device_id of_airoha_match[] = {
++	{ .compatible = "airoha,en7523-eth", .data = &en7523_soc_data },
+ 	{ .compatible = "airoha,en7581-eth", .data = &en7581_soc_data },
+ 	{ .compatible = "airoha,an7583-eth", .data = &an7583_soc_data },
+ 	{ /* sentinel */ }

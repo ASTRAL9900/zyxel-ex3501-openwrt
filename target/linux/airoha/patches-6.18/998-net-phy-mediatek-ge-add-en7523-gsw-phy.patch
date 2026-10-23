@@ -1,0 +1,79 @@
+From: Mehmet Salih <salihmehmet497@gmail.com>
+Subject: net: phy: mediatek-ge: add the Airoha EN7523 embedded switch PHY
+
+The four gigabit PHYs inside the EN7523's embedded MT7530-class switch
+report PHY ID 0x03a294a1, so they were bound to the Generic PHY driver and
+their LED registers stayed at reset defaults (LED0_ON_CTRL 0x800b: polarity
+"active high"). On the Zyxel EX3501-T0 the port LEDs are wired active low,
+so every port LED was lit without a link and went dark with one. Clearing
+the polarity bit live (MMD 0x1f reg 0x21 := 0x000b) made the LEDs behave:
+on with link, blinking with traffic, off otherwise (verified 2026-09-26).
+
+Add the ID as an MT7530-class PHY whose config_init also applies the
+"mediatek,led-config" register list from the device tree, like the MT7531
+path does, so boards can set the LED polarity/mode they need.
+
+--- a/drivers/net/phy/mediatek/mtk-ge.c
++++ b/drivers/net/phy/mediatek/mtk-ge.c
+@@ -8,6 +8,8 @@
+ 
+ #define MTK_GPHY_ID_MT7530		0x03a29412
+ #define MTK_GPHY_ID_MT7531		0x03a29441
++/* MT7530-class PHYs inside the Airoha EN7523 embedded switch */
++#define MTK_GPHY_ID_EN7523		0x03a294a1
+ 
+ #define MTK_PHY_PAGE_EXTENDED_2			0x0002
+ #define MTK_PHY_PAGE_EXTENDED_3			0x0003
+@@ -104,6 +106,23 @@
+ 	return 0;
+ }
+ 
++/*
++ * EN7523 GSW PHY: MT7530-class silicon, but the board wiring decides the
++ * LED polarity, so honour "mediatek,led-config" like the MT7531 path does
++ * (the Zyxel EX3501-T0 needs the LED polarity bit cleared: with the reset
++ * default 0x800b every port LED is lit without link and off with link).
++ */
++static int en7523_phy_config_init(struct phy_device *phydev)
++{
++	int ret;
++
++	ret = mt7530_phy_config_init(phydev);
++	if (ret)
++		return ret;
++
++	return mt7530_led_config_of(phydev);
++}
++
+ static int mt7531_phy_config_init(struct phy_device *phydev)
+ {
+ 	mtk_gephy_config_init(phydev);
+@@ -146,6 +165,20 @@
+ 		.write_page	= mtk_phy_write_page,
+ 	},
+ 	{
++		PHY_ID_MATCH_EXACT(MTK_GPHY_ID_EN7523),
++		.name		= "Airoha EN7523 GSW PHY",
++		.config_init	= en7523_phy_config_init,
++		/* Interrupts are handled by the switch, not the PHY
++		 * itself.
++		 */
++		.config_intr	= genphy_no_config_intr,
++		.handle_interrupt = genphy_handle_interrupt_no_ack,
++		.suspend	= genphy_suspend,
++		.resume		= genphy_resume,
++		.read_page	= mtk_phy_read_page,
++		.write_page	= mtk_phy_write_page,
++	},
++	{
+ 		PHY_ID_MATCH_EXACT(MTK_GPHY_ID_MT7531),
+ 		.name		= "MediaTek MT7531 PHY",
+ 		.config_init	= mt7531_phy_config_init,
+@@ -165,6 +198,7 @@
+ 
+ static const struct mdio_device_id __maybe_unused mtk_gephy_tbl[] = {
+ 	{ PHY_ID_MATCH_EXACT(MTK_GPHY_ID_MT7530) },
++	{ PHY_ID_MATCH_EXACT(MTK_GPHY_ID_EN7523) },
+ 	{ PHY_ID_MATCH_EXACT(MTK_GPHY_ID_MT7531) },
+ 	{ }
+ };
